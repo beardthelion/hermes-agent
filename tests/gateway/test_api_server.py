@@ -2315,3 +2315,200 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+
+# ---------------------------------------------------------------------------
+# Slash command interception
+# ---------------------------------------------------------------------------
+
+
+class TestSlashCommandInterception:
+    """Slash commands are intercepted before the LLM call."""
+
+    @pytest.mark.asyncio
+    async def test_help_command_returns_formatted_list(self, adapter):
+        """/help returns the command list without hitting the LLM."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "/help"}]},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            content = data["choices"][0]["message"]["content"]
+            assert "/new" in content
+            assert "/help" in content
+            assert "/status" in content
+            # Must be a slash response, not an LLM response — no tokens consumed
+            assert data["usage"]["total_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_new_reset_clears_session(self, adapter):
+        """/new and /reset both clear the session and return confirmation."""
+        for cmd in ("/new", "/reset"):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": cmd}]},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert "Session reset" in data["choices"][0]["message"]["content"]
+                assert data["usage"]["total_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_non_slash_message_passes_through_to_llm(self, adapter):
+        """A non-slash message is NOT intercepted — it reaches the agent."""
+        mock_result = {"final_response": "Hello, human!", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 50, "output_tokens": 20, "total_tokens": 70}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, usage)
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hello"}]},
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            # The agent ran and produced a response
+            assert data["choices"][0]["message"]["content"] == "Hello, human!"
+            assert data["usage"]["total_tokens"] == 70
+            mock_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_slash_command_passes_through_to_llm(self, adapter):
+        """/xyz123 (not in supported set) falls through to the LLM."""
+        mock_result = {"final_response": "I don't know that command", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, usage)
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "/xyz123"}]},
+                )
+            assert resp.status == 200
+            data = await resp.json()
+            # The agent ran (not intercepted)
+            assert data["choices"][0]["message"]["content"] == "I don't know that command"
+            mock_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_malformed_slash_not_treated_as_command(self, adapter):
+        """/path/to/file (contains extra slashes) is not parsed as a command."""
+        mock_result = {"final_response": "That looks like a path", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, usage)
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "/path/to/file"}]},
+                )
+            assert resp.status == 200
+            # Falls through to LLM — not treated as a command
+            mock_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_title_set_and_show(self, adapter):
+        """/title sets the session title via SessionDB."""
+        app = _create_app(adapter)
+        session_id = "test-title-session-002"
+
+        # Mock SessionDB to store/retrieve title
+        mock_db = MagicMock()
+        mock_db.sanitize_title = lambda t: t.strip() if t else None
+        mock_db.set_session_title = MagicMock(return_value=True)
+        mock_db.get_session_title = MagicMock(return_value=None)
+        adapter._session_db = mock_db
+
+        async with TestClient(TestServer(app)) as cli:
+            # Set title
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "/title hello world"}]},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert "hello world" in data["choices"][0]["message"]["content"]
+            mock_db.set_session_title.assert_called_once()
+            assert data["usage"]["total_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_retry_triggers_agent_rerun(self, auth_adapter):
+        """/retry rewrites the message and reruns the agent."""
+        mock_result = {"final_response": "Fresh answer!", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 100, "output_tokens": 30, "total_tokens": 130}
+
+        app = _create_app(auth_adapter)
+        session_id = "test-retry-session-004"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_slash_retry", return_value="recovered question"), \
+                 patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, usage)
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": session_id, "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "/retry"}]},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["choices"][0]["message"]["content"] == "Fresh answer!"
+                assert data["usage"]["total_tokens"] == 130
+                # Verify agent was called with the recovered message
+                mock_run.assert_awaited_once()
+                call_kwargs = mock_run.call_args.kwargs
+                assert call_kwargs["user_message"] == "recovered question"
+
+    @pytest.mark.asyncio
+    async def test_undo_removes_last_exchange(self, adapter):
+        """/undo returns a confirmation message."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_slash_undo", return_value="Removed 2 message(s): \"test\""):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "/undo"}]},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                assert "Removed" in content or "Undid" in content
+                assert data["usage"]["total_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_retry_with_no_history_returns_error(self, adapter):
+        """/retry with no prior messages returns a helpful message."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "/retry"}]},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert "No previous message" in data["choices"][0]["message"]["content"]
+            assert data["usage"]["total_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_undo_with_no_history_returns_error(self, adapter):
+        """/undo with nothing to undo returns a helpful message."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "/undo"}]},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert "Nothing to undo" in data["choices"][0]["message"]["content"]
+            assert data["usage"]["total_tokens"] == 0
