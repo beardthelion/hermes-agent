@@ -73,6 +73,9 @@ _API_SERVER_SLASH_COMMANDS: frozenset[str] = frozenset({
     "usage",
     "retry",
     "undo",
+    "profile",
+    "branch",
+    "resume",
 })
 
 
@@ -1038,6 +1041,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 return {"handled": True, "response": "No previous message to retry."}
             return {"handled": True, "rewrite_message": recovered}
 
+        if command == "profile":
+            return {"handled": True, "response": self._slash_profile()}
+
+        if command == "branch":
+            return {"handled": True, "response": self._slash_branch(session_id, args)}
+
+        if command == "resume":
+            return {"handled": True, "response": self._slash_resume(args)}
+
         return None  # Shouldn't reach here, but be safe
 
     # -- individual command handlers -------------------------------------
@@ -1052,6 +1064,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "/usage (token counts), "
             "/retry (rerun last message), "
             "/undo (remove last exchange), "
+            "/profile (show active profile), "
+            "/branch [name] (fork session), "
+            "/resume [name] (resume named session), "
             "/help (this list)"
         )
 
@@ -1238,6 +1253,188 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         return last_user_content
+
+    def _slash_profile(self) -> str:
+        """Return the active profile name and home directory.
+
+        Mirrors ``_handle_profile_command`` in gateway/run.py.
+        """
+        from hermes_constants import display_hermes_home
+        from hermes_cli.profiles import get_active_profile_name
+
+        display = display_hermes_home()
+        profile_name = get_active_profile_name()
+
+        lines = [
+            f"👤 Profile: `{profile_name}`",
+            f"📂 Home: `{display}`",
+        ]
+        return "\n".join(lines)
+
+    def _slash_branch(self, session_id: str, args: str) -> str:
+        """Fork the current session into a new independent copy.
+
+        Copies conversation history to a new session so callers can explore
+        a different path without losing the original.  Returns the new
+        session_id for the caller to use via ``X-Hermes-Session-Id`` on
+        subsequent requests.
+
+        Mirrors ``_handle_branch_command`` in gateway/run.py.
+        """
+        import uuid as _uuid
+        from datetime import datetime as _dt
+
+        db = self._ensure_session_db()
+        if db is None:
+            return "Session database not available."
+
+        # Load current session transcript
+        messages = db.get_messages(session_id)
+        if not messages:
+            return "No conversation to branch — send a message first."
+
+        branch_name = args
+
+        # Generate new session_id — same format as gateway/run.py:9141
+        now = _dt.now()
+        timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+        short_uuid = _uuid.uuid4().hex[:6]
+        new_session_id = f"{timestamp_str}_{short_uuid}"
+
+        # Determine branch title
+        if branch_name:
+            branch_title = branch_name
+        else:
+            current_title = db.get_session_title(session_id)
+            base = current_title or "branch"
+            branch_title = db.get_next_title_in_lineage(base)
+
+        # Create the new session with parent link
+        try:
+            db.create_session(
+                session_id=new_session_id,
+                source="api_server",
+                parent_session_id=session_id,
+            )
+        except Exception as e:
+            logger.error("Failed to create branch session: %s", e)
+            return f"Failed to create branch: {e}"
+
+        # Copy conversation history to the new session
+        for msg in messages:
+            try:
+                db.append_message(
+                    session_id=new_session_id,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                    tool_name=msg.get("tool_name") or msg.get("name"),
+                    tool_calls=msg.get("tool_calls"),
+                    tool_call_id=msg.get("tool_call_id"),
+                    finish_reason=msg.get("finish_reason"),
+                    reasoning=msg.get("reasoning"),
+                    reasoning_content=msg.get("reasoning_content"),
+                    reasoning_details=msg.get("reasoning_details"),
+                    codex_reasoning_items=msg.get("codex_reasoning_items"),
+                    codex_message_items=msg.get("codex_message_items"),
+                )
+            except Exception:
+                pass  # Best-effort copy
+
+        # Set title
+        try:
+            db.set_session_title(new_session_id, branch_title)
+        except Exception:
+            pass
+
+        user_msg_count = len([m for m in messages if m.get("role") == "user"])
+        return (
+            f"⑂ Branched to **{branch_title}**\n"
+            f"Session ID: `{new_session_id}` ({user_msg_count} msg)"
+        )
+
+    def _slash_resume(self, args: str) -> str:
+        """Resolve a session title to its session_id.
+
+        ``/resume`` with no arguments lists recently titled sessions.
+        ``/resume <name>`` resolves *name* to a session_id via
+        ``SessionDB.resolve_session_by_title()``.
+
+        The api_server has no server-side session state to switch — the
+        returned session_id is for the caller to use on subsequent requests
+        via ``X-Hermes-Session-Id``.  This mirrors the gateway's
+        ``_handle_resume_command``, adapted for the stateless HTTP model.
+
+        Mirrors ``_handle_resume_command`` in gateway/run.py.
+        """
+        db = self._ensure_session_db()
+        if db is None:
+            return "Session database not available."
+
+        if not args:
+            # List recent titled sessions
+            try:
+                sessions = db.list_sessions_rich(source="api_server", limit=10)
+                # Also include sessions without an explicit source (bridge
+                # sessions created via X-Hermes-Session-Id may have source="")
+                all_sessions = db.list_sessions_rich(limit=20)
+                titled: list[dict] = []
+                seen: set[str] = set()
+                for s in sessions + all_sessions:
+                    sid = s.get("id", "")
+                    title = s.get("title")
+                    if title and sid not in seen:
+                        seen.add(sid)
+                        titled.append(s)
+                titled = titled[:10]
+
+                if not titled:
+                    return (
+                        "No named sessions found.\n"
+                        "Use `/title My Session` to name your current "
+                        "session, then `/resume My Session` to return to "
+                        "it later."
+                    )
+
+                lines = ["📋 **Named Sessions**\n"]
+                for s in titled:
+                    title = s["title"]
+                    msg_count = s.get("message_count", 0) or 0
+                    lines.append(f"• **{title}** — {msg_count} msg")
+                lines.append("\nUsage: `/resume <name>`")
+                return "\n".join(lines)
+            except Exception as e:
+                logger.debug("Failed to list titled sessions: %s", e)
+                return f"Could not list sessions: {e}"
+
+        name = args
+
+        # Resolve the name to a session ID
+        target_id = db.resolve_session_by_title(name)
+        if not target_id:
+            return (
+                f"No session found matching '{name}'.\n"
+                "Use `/resume` with no arguments to see available sessions."
+            )
+
+        # Follow compression chain — resolves continuation IDs
+        try:
+            target_id = db.resolve_resume_session_id(target_id)
+        except Exception as e:
+            logger.debug(
+                "Failed to resolve resume continuation for %s: %s",
+                target_id, e,
+            )
+
+        # Get title for confirmation
+        title = db.get_session_title(target_id) or name
+
+        # Count messages
+        msg_count = db.message_count(target_id) or 0
+
+        return (
+            f"↻ Resumed **{title}**\n"
+            f"Session ID: `{target_id}` ({msg_count} msg)"
+        )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
