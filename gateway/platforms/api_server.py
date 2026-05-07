@@ -1015,6 +1015,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # commands (/personality, /voice, /model, …) fall through to the
         # LLM as normal user messages.
         if command not in _API_SERVER_SLASH_COMMANDS:
+            # ── user-defined quick commands (bypass LLM) ────────────────
+            # Check the gateway config's quick_commands section before
+            # falling through.  Supports 'exec' type only (alias expansion
+            # is handled by the gateway's main message pipeline).
+            qcmds = self._get_quick_commands()
+            if command in qcmds:
+                qc = qcmds[command]
+                if qc.get("type") == "exec":
+                    result = await self._run_quick_command(command, qc, args)
+                    if result is not None:
+                        return result
             return None
 
         if command in ("help",):
@@ -1051,6 +1062,53 @@ class APIServerAdapter(BasePlatformAdapter):
             return {"handled": True, "response": self._slash_resume(args)}
 
         return None  # Shouldn't reach here, but be safe
+
+    # -- quick_commands helpers -------------------------------------------
+
+    def _get_quick_commands(self) -> dict:
+        """Return the quick_commands dict from the gateway config, or {}."""
+        gw = getattr(self, "gateway_runner", None)
+        if gw is None:
+            return {}
+        gw_config = getattr(gw, "config", None)
+        if gw_config is None:
+            return {}
+        if isinstance(gw_config, dict):
+            qcmds = gw_config.get("quick_commands", {}) or {}
+        else:
+            qcmds = getattr(gw_config, "quick_commands", {}) or {}
+        return qcmds if isinstance(qcmds, dict) else {}
+
+    async def _run_quick_command(
+        self, command: str, qc: dict, args: str
+    ) -> Optional[dict]:
+        """Execute a user-defined exec quick command and return its result."""
+        import asyncio
+
+        exec_cmd = qc.get("command", "")
+        if not exec_cmd:
+            return {"handled": True,
+                    "response": f"Quick command '/{command}' has no command defined."}
+
+        # Substitute {args} placeholder with actual slash-command arguments
+        cmd = exec_cmd.replace("{args}", args.strip())
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            output = (stdout or stderr).decode().strip()
+            return {"handled": True,
+                    "response": output if output else "Command returned no output."}
+        except asyncio.TimeoutError:
+            return {"handled": True,
+                    "response": "Quick command timed out (30s)."}
+        except Exception as e:
+            return {"handled": True,
+                    "response": f"Quick command error: {e}"}
 
     # -- individual command handlers -------------------------------------
 
