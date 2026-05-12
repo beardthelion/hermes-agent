@@ -196,6 +196,17 @@ class SendblueAdapter(BasePlatformAdapter):
             logger.error("[sendblue] API GET error (%s): %s", endpoint, e)
             return 0, str(e)
 
+    def _verify_signature(self, header_value: str) -> bool:
+        """Verify the sb-signing-secret header against the configured webhook_secret.
+
+        Returns True if no secret is configured (signature verification disabled
+        with operator warning at connect() time). Otherwise returns True only on
+        exact string equality match.
+        """
+        if not self.webhook_secret:
+            return True
+        return header_value == self.webhook_secret
+
     # -- abstract method stubs (implemented in subsequent steps) --
 
     async def connect(self) -> bool:
