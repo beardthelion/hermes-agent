@@ -409,6 +409,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.BLUEBUBBLES: lambda cfg: bool(
         cfg.extra.get("server_url") and cfg.extra.get("password")
     ),
+    Platform.SENDBLUE: lambda cfg: bool(
+        cfg.extra.get("api_key_id") and cfg.extra.get("api_secret")
+    ),
     Platform.QQBOT: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("client_secret")
     ),
