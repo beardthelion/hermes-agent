@@ -1655,6 +1655,33 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             thread_id=os.getenv("BLUEBUBBLES_HOME_CHANNEL_THREAD_ID") or None,
         )
 
+    # Sendblue (iMessage via cloud relay)
+    sendblue_api_key_id = os.getenv("SENDBLUE_API_KEY_ID")
+    sendblue_api_secret = os.getenv("SENDBLUE_API_SECRET")
+    if sendblue_api_key_id and sendblue_api_secret:
+        if Platform.SENDBLUE not in config.platforms:
+            config.platforms[Platform.SENDBLUE] = PlatformConfig()
+        config.platforms[Platform.SENDBLUE].enabled = True
+        config.platforms[Platform.SENDBLUE].extra.update({
+            "api_key_id": sendblue_api_key_id,
+            "api_secret": sendblue_api_secret,
+            "sendblue_number": os.getenv("SENDBLUE_NUMBER", ""),
+            "webhook_host": os.getenv("SENDBLUE_WEBHOOK_HOST", "127.0.0.1"),
+            "webhook_port": int(os.getenv("SENDBLUE_WEBHOOK_PORT", "8665")),
+            "webhook_path": os.getenv("SENDBLUE_WEBHOOK_PATH", "/sendblue-gateway/receive"),
+            "webhook_secret": os.getenv("SENDBLUE_WEBHOOK_SECRET", ""),
+            "send_read_receipts": os.getenv("SENDBLUE_SEND_READ_RECEIPTS", "true").lower() in {"true", "1", "yes"},
+            "multi_bubble_split": os.getenv("SENDBLUE_MULTI_BUBBLE_SPLIT", "false").lower() in {"true", "1", "yes"},
+        })
+    sendblue_home = os.getenv("SENDBLUE_HOME_CHANNEL")
+    if sendblue_home and Platform.SENDBLUE in config.platforms:
+        config.platforms[Platform.SENDBLUE].home_channel = HomeChannel(
+            platform=Platform.SENDBLUE,
+            chat_id=sendblue_home,
+            name=os.getenv("SENDBLUE_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("SENDBLUE_HOME_CHANNEL_THREAD_ID") or None,
+        )
+
     # QQ (Official Bot API v2)
     qq_app_id = os.getenv("QQ_APP_ID")
     qq_client_secret = os.getenv("QQ_CLIENT_SECRET")
