@@ -107,6 +107,7 @@ class Platform(Enum):
     WECOM_CALLBACK = "wecom_callback"
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
+    SENDBLUE = "sendblue"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
     @classmethod
