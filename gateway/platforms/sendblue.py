@@ -134,4 +134,4 @@ class SendblueAdapter(BasePlatformAdapter):
         raise NotImplementedError("send() not yet implemented")
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        raise NotImplementedError("get_chat_info() not yet implemented")
+        return {"name": chat_id, "type": "dm"}
