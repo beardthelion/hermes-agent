@@ -116,6 +116,86 @@ class SendblueAdapter(BasePlatformAdapter):
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
 
+    # ------------------------------------------------------------------
+    # API helpers
+    # ------------------------------------------------------------------
+
+    def _build_api_headers(self) -> Dict[str, str]:
+        """Build the standard Sendblue API auth headers."""
+        return {
+            "sb-api-key-id": self.api_key_id,
+            "sb-api-secret-key": self.api_secret,
+            "Content-Type": "application/json",
+        }
+
+    async def _sendblue_api_post(
+        self,
+        endpoint: str,
+        json_body: Dict[str, Any],
+        timeout: float = 10.0,
+    ) -> tuple:
+        """POST to Sendblue API. Returns (status_code, response_text).
+
+        On timeout: returns (0, "timeout") and logs WARNING.
+        On other errors: returns (0, str(error)) and logs ERROR.
+        Caller is responsible for status code interpretation.
+        """
+        if self.client is None:
+            logger.error("[sendblue] _sendblue_api_post called before connect()")
+            return 0, "client_not_initialized"
+        url = f"{SENDBLUE_API_BASE}/{endpoint}"
+        try:
+            resp = await self.client.post(
+                url,
+                json=json_body,
+                headers=self._build_api_headers(),
+                timeout=timeout,
+            )
+            return resp.status_code, resp.text
+        except httpx.TimeoutException:
+            logger.warning(
+                "[sendblue] API POST timeout: %s (%.0fs)", endpoint, timeout
+            )
+            return 0, "timeout"
+        except Exception as e:
+            logger.error("[sendblue] API POST error (%s): %s", endpoint, e)
+            return 0, str(e)
+
+    async def _sendblue_api_get(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: float = 5.0,
+    ) -> tuple:
+        """GET from Sendblue API. Returns (status_code, response_dict_or_text).
+
+        Response is JSON-parsed when possible; falls back to text on parse failure.
+        Error handling matches _sendblue_api_post.
+        """
+        if self.client is None:
+            logger.error("[sendblue] _sendblue_api_get called before connect()")
+            return 0, "client_not_initialized"
+        url = f"{SENDBLUE_API_BASE}/{endpoint}"
+        try:
+            resp = await self.client.get(
+                url,
+                params=params,
+                headers=self._build_api_headers(),
+                timeout=timeout,
+            )
+            try:
+                return resp.status_code, resp.json()
+            except Exception:
+                return resp.status_code, resp.text
+        except httpx.TimeoutException:
+            logger.warning(
+                "[sendblue] API GET timeout: %s (%.0fs)", endpoint, timeout
+            )
+            return 0, "timeout"
+        except Exception as e:
+            logger.error("[sendblue] API GET error (%s): %s", endpoint, e)
+            return 0, str(e)
+
     # -- abstract method stubs (implemented in subsequent steps) --
 
     async def connect(self) -> bool:
