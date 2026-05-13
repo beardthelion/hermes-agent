@@ -324,6 +324,19 @@ class SendblueAdapter(BasePlatformAdapter):
             )
             return False
 
+    @staticmethod
+    def _value(*candidates: Any) -> Optional[str]:
+        """Return the first non-empty stripped string from candidates, or None.
+
+        Used in _handle_webhook for field extraction with fallbacks
+        (e.g. _value(item.get("content"), item.get("text"), item.get("body"))).
+        Whitespace-only candidates are treated as empty.
+        """
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+
     async def _handle_webhook(self, request):
         """Sendblue webhook handler — stub. Real implementation in step 13.
 
