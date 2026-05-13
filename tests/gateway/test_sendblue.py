@@ -397,3 +397,98 @@ class TestSendblueOutboundSend:
         result = await adapter.send("+17766768883", "hello")
         assert result.success is False
         assert result.retryable is False
+
+
+class TestSendblueSendImage:
+    def test_public_image_url_truth_table(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        # Public HTTPS image URLs -> True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.jpg") is True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.png") is True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.JPG") is True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.heic") is True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.jpg?token=abc") is True
+
+    def test_non_public_url_truth_table(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        # Non-HTTPS or no/wrong extension -> False
+        assert adapter._is_public_image_url("http://cdn.example.com/img.jpg") is False
+        assert adapter._is_public_image_url("file:///tmp/img.jpg") is False
+        assert adapter._is_public_image_url("https://cdn.example.com/img.txt") is False
+        assert adapter._is_public_image_url("https://cdn.example.com/noext") is False
+        assert adapter._is_public_image_url("") is False
+        assert adapter._is_public_image_url("not-a-url") is False
+
+    @pytest.mark.asyncio
+    async def test_public_image_sends_with_media_url(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, '{"message_handle": "img-abc"}')
+        )
+        result = await adapter.send_image(
+            "+17766768883",
+            "https://cdn.example.com/img.jpg",
+            caption=None,
+        )
+        assert result.success is True
+        assert result.message_id == "img-abc"
+        adapter._sendblue_api_post.assert_called_once_with(
+            "send-message",
+            {
+                "number": "+17766768883",
+                "from_number": "+15555550100",
+                "media_url": "https://cdn.example.com/img.jpg",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_public_image_with_caption_includes_content(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, '{"message_handle": "img-xyz"}')
+        )
+        result = await adapter.send_image(
+            "+17766768883",
+            "https://cdn.example.com/img.jpg",
+            caption="look at this",
+        )
+        assert result.success is True
+        adapter._sendblue_api_post.assert_called_once_with(
+            "send-message",
+            {
+                "number": "+17766768883",
+                "from_number": "+15555550100",
+                "media_url": "https://cdn.example.com/img.jpg",
+                "content": "look at this",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_public_url_falls_back_to_base_class(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock()  # should not be called
+        super_send_image = AsyncMock()
+        monkeypatch.setattr(
+            "gateway.platforms.base.BasePlatformAdapter.send_image",
+            super_send_image,
+        )
+        await adapter.send_image(
+            "+17766768883",
+            "http://cdn.example.com/img.jpg",  # http, not https
+            caption="hi",
+        )
+        super_send_image.assert_called_once()
+        adapter._sendblue_api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_4xx_returns_non_retryable_failure(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(400, '{"error": "invalid media_url"}')
+        )
+        result = await adapter.send_image(
+            "+17766768883",
+            "https://cdn.example.com/img.jpg",
+        )
+        assert result.success is False
+        assert result.retryable is False
