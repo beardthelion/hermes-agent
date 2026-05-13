@@ -211,6 +211,119 @@ class SendblueAdapter(BasePlatformAdapter):
             return True
         return header_value == self.webhook_secret
 
+    async def _find_registered_webhook_urls(self) -> List[str]:
+        """Fetch the list of currently-registered receive webhook URLs.
+
+        Returns empty list on API failure (logged at WARNING in caller context).
+        Caller is responsible for deciding what to do with the result.
+        """
+        if self.client is None:
+            return []
+        status, body = await self._sendblue_api_get("account/webhooks")
+        if status != 200 or not isinstance(body, dict):
+            return []
+        webhooks = body.get("webhooks", {})
+        if not isinstance(webhooks, dict):
+            return []
+        receive_list = webhooks.get("receive", [])
+        if not isinstance(receive_list, list):
+            return []
+        urls = []
+        for entry in receive_list:
+            if isinstance(entry, dict) and isinstance(entry.get("url"), str):
+                urls.append(entry["url"])
+        return urls
+
+    async def _register_webhook(self) -> bool:
+        """Register self.webhook_public_url with Sendblue's API.
+
+        Crash-resilient: if our URL is already in the receive list, skip the
+        POST and return True. This handles restart-after-crash without
+        duplicate registrations.
+
+        Returns True on success or already-registered. Returns False on missing
+        config, missing client, or API failure. A False return does NOT fail
+        connect() — webhook server still runs locally, just won't receive
+        traffic until the URL is manually registered or next connect retry.
+        """
+        if not self.webhook_public_url:
+            logger.warning(
+                "[sendblue] SENDBLUE_WEBHOOK_PUBLIC_URL not set — webhook registration skipped"
+            )
+            return False
+        if self.client is None:
+            logger.error("[sendblue] _register_webhook called before connect()")
+            return False
+
+        existing_urls = await self._find_registered_webhook_urls()
+        if self.webhook_public_url in existing_urls:
+            logger.info(
+                "[sendblue] webhook already registered: %s", self.webhook_public_url
+            )
+            return True
+
+        payload = {
+            "webhooks": [
+                {"url": self.webhook_public_url, "secret": self.webhook_secret}
+            ],
+            "type": "receive",
+        }
+        status, body = await self._sendblue_api_post("account/webhooks", payload)
+        if 200 <= status < 300:
+            logger.info(
+                "[sendblue] webhook registered with Sendblue: %s",
+                self.webhook_public_url,
+            )
+            return True
+        logger.warning(
+            "[sendblue] webhook registration failed (status %s): %s", status, body
+        )
+        return False
+
+    async def _unregister_webhook(self) -> bool:
+        """Unregister self.webhook_public_url from Sendblue's API.
+
+        Inline DELETE call (no shared helper — only callsite in MVP).
+        Returns True if the DELETE succeeded, False on missing config,
+        missing client, or API failure. Failures are logged at DEBUG
+        per architecture Section 6 (non-critical — webhook re-registration
+        on next connect() handles cleanup).
+        """
+        if not self.webhook_public_url:
+            return True  # nothing to do, no warning on cleanup path
+        if self.client is None:
+            return False
+
+        url = f"{SENDBLUE_API_BASE}/account/webhooks"
+        payload = {
+            "webhooks": [self.webhook_public_url],
+            "type": "receive",
+        }
+        try:
+            resp = await self.client.request(
+                "DELETE",
+                url,
+                json=payload,
+                headers=self._build_api_headers(),
+                timeout=5.0,
+            )
+            if 200 <= resp.status_code < 300:
+                logger.info(
+                    "[sendblue] webhook unregistered: %s", self.webhook_public_url
+                )
+                return True
+            logger.debug(
+                "[sendblue] webhook unregistration returned status %s: %s",
+                resp.status_code,
+                resp.text,
+            )
+            return False
+        except Exception as exc:
+            logger.debug(
+                "[sendblue] webhook unregistration failed (non-critical): %s", exc
+            )
+            return False
+
     # -- abstract method stubs (implemented in subsequent steps) --
 
     async def connect(self) -> bool:
