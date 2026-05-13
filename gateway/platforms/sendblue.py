@@ -324,6 +324,18 @@ class SendblueAdapter(BasePlatformAdapter):
             )
             return False
 
+    async def _handle_webhook(self, request):
+        """Sendblue webhook handler — stub. Real implementation in step 13.
+
+        Returns 501 Not Implemented so Sendblue treats this as a server-side
+        failure rather than a permanent rejection. The handler exists as a
+        placeholder so connect() step 4 can register it as the aiohttp route
+        without raising AttributeError; the actual signature verification,
+        payload parsing, and message dispatch land in the next step.
+        """
+        from aiohttp import web
+        return web.Response(status=501, text="not implemented")
+
     # -- abstract method stubs (implemented in subsequent steps) --
 
     async def connect(self) -> bool:
@@ -407,7 +419,25 @@ class SendblueAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        raise NotImplementedError("disconnect() not yet implemented")
+        """Disconnect from Sendblue and tear down the webhook server.
+
+        See architecture Section 3 disconnect sequence.
+        """
+        # Step 1: Unregister webhook (non-critical, logged at DEBUG on failure)
+        await self._unregister_webhook()
+
+        # Step 2: Close HTTP client
+        if self.client:
+            await self.client.aclose()
+            self.client = None
+
+        # Step 3: Shutdown webhook server
+        if self._runner:
+            await self._runner.cleanup()
+            self._runner = None
+
+        # Step 4: Mark disconnected
+        self._mark_disconnected()
 
     async def send(
         self,
