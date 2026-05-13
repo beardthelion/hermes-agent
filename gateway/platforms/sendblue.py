@@ -678,6 +678,9 @@ class SendblueAdapter(BasePlatformAdapter):
         # Step 4: Mark disconnected
         self._mark_disconnected()
 
+    def format_message(self, content: str) -> str:
+        return strip_markdown(content)
+
     async def send(
         self,
         chat_id: str,
@@ -685,7 +688,93 @@ class SendblueAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        raise NotImplementedError("send() not yet implemented")
+        """Send an outbound text message via POST /api/send-message.
+
+        Strips markdown via format_message(). If multi_bubble_split is
+        enabled, splits on paragraph breaks (\\n\\s*\\n) first. Any
+        chunk exceeding MAX_MESSAGE_LENGTH is further split via the
+        inherited truncate_message(). Each chunk is POSTed as its own
+        Sendblue API call; the message_id of the last successful chunk
+        is returned as the SendResult.message_id.
+
+        Architecture: Section 5 H1-H9. Mirrors bluebubbles.py:404-456
+        with Sendblue-specific payload shape and API helper contract.
+
+        reply_to and metadata parameters are accepted for interface
+        compatibility but currently ignored -- Sendblue MVP does not
+        implement message threading.
+        """
+        if reply_to is not None or metadata:
+            logger.debug(
+                "[sendblue] send() ignoring reply_to=%r metadata=%r "
+                "(not implemented in MVP)",
+                reply_to,
+                metadata,
+            )
+
+        text = self.format_message(content)
+        if not text:
+            return SendResult(
+                success=False,
+                error="Sendblue send requires non-empty text",
+            )
+
+        # Determine chunks: paragraph-split if multi-bubble enabled,
+        # otherwise single chunk. Either way, oversized chunks get
+        # further split by the inherited truncate_message().
+        if self.multi_bubble_split:
+            paragraphs = [
+                p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()
+            ]
+        else:
+            paragraphs = [text]
+
+        chunks: List[str] = []
+        for para in paragraphs:
+            if len(para) <= self.MAX_MESSAGE_LENGTH:
+                chunks.append(para)
+            else:
+                chunks.extend(
+                    self.truncate_message(
+                        para, max_length=self.MAX_MESSAGE_LENGTH
+                    )
+                )
+
+        last = SendResult(success=True)
+        for chunk in chunks:
+            payload: Dict[str, Any] = {
+                "number": chat_id,
+                "from_number": self.sendblue_number,
+                "content": chunk,
+            }
+            status, body = await self._sendblue_api_post(
+                "send-message", payload
+            )
+            if not (200 <= status < 300):
+                retryable = (status == 0 or status >= 500)
+                logger.error(
+                    "[sendblue] send failed status=%d retryable=%s body=%s",
+                    status,
+                    retryable,
+                    body[:200],
+                )
+                return SendResult(
+                    success=False,
+                    error=f"Sendblue API returned {status}: {body[:200]}",
+                    retryable=retryable,
+                )
+            try:
+                parsed = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            msg_id = parsed.get("message_handle") or "ok"
+            last = SendResult(
+                success=True,
+                message_id=str(msg_id),
+                raw_response=parsed,
+            )
+
+        return last
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "dm"}
