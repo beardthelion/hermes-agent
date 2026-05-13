@@ -1669,6 +1669,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "webhook_host": os.getenv("SENDBLUE_WEBHOOK_HOST", "127.0.0.1"),
             "webhook_port": int(os.getenv("SENDBLUE_WEBHOOK_PORT", "8665")),
             "webhook_path": os.getenv("SENDBLUE_WEBHOOK_PATH", "/sendblue-gateway/receive"),
+            "webhook_public_url": os.getenv("SENDBLUE_WEBHOOK_PUBLIC_URL", ""),
             "webhook_secret": os.getenv("SENDBLUE_WEBHOOK_SECRET", ""),
             "send_read_receipts": os.getenv("SENDBLUE_SEND_READ_RECEIPTS", "true").lower() in {"true", "1", "yes"},
             "multi_bubble_split": os.getenv("SENDBLUE_MULTI_BUBBLE_SPLIT", "false").lower() in {"true", "1", "yes"},

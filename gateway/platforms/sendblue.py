@@ -108,6 +108,10 @@ class SendblueAdapter(BasePlatformAdapter):
         )
         if not str(self.webhook_path).startswith("/"):
             self.webhook_path = f"/{self.webhook_path}"
+        self.webhook_public_url = (
+            extra.get("webhook_public_url")
+            or os.getenv("SENDBLUE_WEBHOOK_PUBLIC_URL", "")
+        )
         self.webhook_secret = (
             extra.get("webhook_secret") or os.getenv("SENDBLUE_WEBHOOK_SECRET", "")
         )
