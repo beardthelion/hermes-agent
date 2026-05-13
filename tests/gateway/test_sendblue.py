@@ -1,5 +1,6 @@
 """Tests for the Sendblue iMessage gateway adapter."""
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -31,14 +32,19 @@ class _MockRequest:
     """Minimal aiohttp.Request surface for _handle_webhook tests.
 
     Exposes .headers, .json() async, and .remote. Enough for the handler
-    to do signature check, body parse, and logging — no more.
+    to do signature check, body parse, and logging — no more. Pass
+    json_error to make .json() raise that exception (used to test the
+    JSONDecodeError → 400 path).
     """
-    def __init__(self, body, headers=None, remote="127.0.0.1"):
+    def __init__(self, body=None, headers=None, remote="127.0.0.1", json_error=None):
         self._body = body
         self.headers = headers or {}
         self.remote = remote
+        self._json_error = json_error
 
     async def json(self):
+        if self._json_error is not None:
+            raise self._json_error
         return self._body
 
 
@@ -136,3 +142,95 @@ class TestSendblueWebhookRouting:
         await _drain_background_tasks(adapter)
         assert response.status == 200
         assert adapter.handle_message.call_count == 1
+
+
+class TestSendblueWebhookParsing:
+    @pytest.mark.asyncio
+    async def test_single_object_normalized_to_list(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            "content": "hello",
+        }
+        request = _MockRequest(
+            body=payload,  # dict, not list
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_array_processed_as_list(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        item = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            "content": "hello",
+        }
+        request = _MockRequest(
+            body=[item, item],  # array of two valid items
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_returns_400(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        request = _MockRequest(
+            json_error=json.JSONDecodeError("expecting value", "", 0),
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 400
+        assert adapter.handle_message.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_from_number_skipped(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            # no from_number
+            "content": "hello",
+        }
+        request = _MockRequest(
+            body=payload,
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        # Item skipped at required-fields check, but batch still succeeds
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_content_skipped(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            # no content, no media_url — no text source at all
+        }
+        request = _MockRequest(
+            body=payload,
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 0
