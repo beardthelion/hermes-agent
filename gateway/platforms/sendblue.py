@@ -337,6 +337,23 @@ class SendblueAdapter(BasePlatformAdapter):
                 return candidate.strip()
         return None
 
+    @staticmethod
+    def _message_type_from_mime(mime_type: str) -> MessageType:
+        """Map a MIME type string to the corresponding MessageType enum.
+
+        image/* → PHOTO, audio/* → VOICE, video/* → VIDEO, else DOCUMENT.
+        Matches the routing in bluebubbles.py:844-859. MVP only exercises
+        the PHOTO branch (images-only); other branches are scaffolded for
+        future audio/video/document support.
+        """
+        if mime_type.startswith("image/"):
+            return MessageType.PHOTO
+        if mime_type.startswith("audio/"):
+            return MessageType.VOICE
+        if mime_type.startswith("video/"):
+            return MessageType.VIDEO
+        return MessageType.DOCUMENT
+
     async def _handle_webhook(self, request):
         """Sendblue webhook handler — stub. Real implementation in step 13.
 
