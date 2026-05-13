@@ -450,16 +450,130 @@ class SendblueAdapter(BasePlatformAdapter):
         return "application/octet-stream"
 
     async def _handle_webhook(self, request):
-        """Sendblue webhook handler — stub. Real implementation in step 13.
+        """Handle inbound Sendblue webhook POST.
 
-        Returns 501 Not Implemented so Sendblue treats this as a server-side
-        failure rather than a permanent rejection. The handler exists as a
-        placeholder so connect() step 4 can register it as the aiohttp route
-        without raising AttributeError; the actual signature verification,
-        payload parsing, and message dispatch land in the next step.
+        Verifies the sb-signing-secret header, parses the JSON body
+        (accepting either a single message object or a list of them),
+        and dispatches each inbound message to the agent via
+        handle_message(). Outbound echoes and messages for other
+        sendblue_numbers are filtered out silently. Returns 200 "ok"
+        on any successfully processed batch, 401/400 on auth/parse
+        failures.
+
+        Architecture: Section 4. Mirrors bluebubbles.py:768-936 with
+        Sendblue-specific signature model, flat payload shape, and
+        DM-only assumption.
         """
-        from aiohttp import web
-        return web.Response(status=501, text="not implemented")
+        # -- STEP 1: Signature verification --
+        secret = request.headers.get(self.SIGNATURE_HEADER, "")
+        if not self._verify_signature(secret):
+            logger.warning(
+                "[sendblue] signature verification failed from %s",
+                request.remote,
+            )
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        # -- STEP 2: Body parsing --
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            logger.error("[sendblue] webhook parse error: %s", exc)
+            return web.json_response({"error": "invalid payload"}, status=400)
+
+        items = body if isinstance(body, list) else [body]
+
+        # -- STEP 3: Per-message loop --
+        for item in items:
+            if not isinstance(item, dict):
+                logger.debug("[sendblue] skipping non-dict item: %r", item)
+                continue
+
+            # -- STEP 3a: Skip outbound echoes --
+            if item.get("is_outbound"):
+                continue
+
+            # -- STEP 3b: Routing filter -- is this for our number? --
+            inbound_line = self._value(
+                item.get("sendblue_number"),
+                item.get("to_number"),
+            )
+            if self.sendblue_number and inbound_line != self.sendblue_number:
+                continue
+
+            # -- STEP 3c: Allowed-number check is handled at gateway level --
+            # (gateway runner's _is_user_authorized() runs before dispatch)
+
+            # -- STEP 3d: Extract fields --
+            text = self._value(
+                item.get("content"),
+                item.get("text"),
+                item.get("body"),
+            ) or ""
+            from_number = item.get("from_number", "")
+            msg_handle = item.get("message_handle", "")
+            media_url = (item.get("media_url") or "").strip() or None
+
+            # -- STEP 3e: Media handling --
+            media_urls: List[str] = []
+            media_types: List[str] = []
+            msg_type = MessageType.TEXT
+            if media_url:
+                cached_path, mime_type = await self._download_and_cache_media(
+                    media_url
+                )
+                if cached_path:
+                    media_urls.append(cached_path)
+                    media_types.append(mime_type)
+                    msg_type = self._message_type_from_mime(mime_type)
+                else:
+                    logger.warning(
+                        "[sendblue] media download failed for %s", media_url
+                    )
+                    # Continue with text-only -- don't fail the whole message
+            if not text and media_urls:
+                text = "(attachment)"
+            # Media-only message where all downloads fail falls through to
+            # Step 3f and is silently dropped (no text, nothing to dispatch).
+
+            # -- STEP 3f: Required fields check --
+            if not from_number or not text:
+                logger.debug(
+                    "[sendblue] missing required fields -- "
+                    "from_number=%r, has_text=%s",
+                    from_number,
+                    bool(text),
+                )
+                continue
+
+            # -- STEP 3g: Build MessageEvent --
+            source = self.build_source(
+                chat_id=from_number,
+                chat_name=from_number,
+                chat_type="dm",
+                user_id=from_number,
+                user_name=from_number,
+            )
+            event = MessageEvent(
+                text=text,
+                message_type=msg_type,
+                source=source,
+                raw_message=item,
+                message_id=msg_handle,
+                media_urls=media_urls,
+                media_types=media_types,
+            )
+
+            # -- STEP 3h: Dispatch to agent --
+            task = asyncio.create_task(self.handle_message(event))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+            # -- STEP 3i: Read receipts deferred until mark_read() lands --
+            # if self.send_read_receipts:
+            #     asyncio.create_task(self.mark_read(from_number))
+
+        # -- STEP 4: Return --
+        return web.Response(text="ok")
 
     # -- abstract method stubs (implemented in subsequent steps) --
 
