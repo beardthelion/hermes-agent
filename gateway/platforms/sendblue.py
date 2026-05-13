@@ -82,6 +82,9 @@ class SendblueAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = MAX_TEXT_LENGTH
 
+    _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"})
+    _AUDIO_EXTENSIONS = frozenset({".caf", ".m4a", ".mp3", ".wav", ".aac", ".ogg", ".flac"})
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SENDBLUE)
         extra = config.extra or {}
@@ -353,6 +356,98 @@ class SendblueAdapter(BasePlatformAdapter):
         if mime_type.startswith("video/"):
             return MessageType.VIDEO
         return MessageType.DOCUMENT
+
+    async def _download_and_cache_media(
+        self, media_url: str
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Download a Sendblue CDN media URL and cache it locally.
+
+        Returns (local_path, mime_type) on success, (None, None) on failure.
+        MIME type is inferred from the URL extension (Sendblue doesn't provide
+        Content-Type in the webhook payload — extension is the only signal).
+
+        For MVP, only image extensions are cached (matching architecture
+        Section 1 "Images only for MVP"). Audio and document extensions
+        log a WARNING and return (None, None) so the caller can fall
+        back to text-only processing.
+        """
+        if not self.client:
+            return None, None
+        if not media_url:
+            return None, None
+
+        # Extract extension from URL (strip query string, last path segment).
+        # Matches bridge.py:_detect_media_type pattern.
+        path = media_url.split("?")[0]
+        stem = path.rsplit("/", 1)[-1] if "/" in path else path
+        ext = "." + stem.rsplit(".", 1)[-1].lower() if "." in stem else ""
+
+        # MVP: images only. Audio (e.g. .caf voice memos) deferred.
+        if ext not in self._IMAGE_EXTENSIONS:
+            if ext in self._AUDIO_EXTENSIONS:
+                logger.warning(
+                    "[sendblue] audio attachment received (%s) but audio "
+                    "support is deferred — skipped",
+                    ext,
+                )
+            else:
+                logger.warning(
+                    "[sendblue] unsupported media extension %r — skipped",
+                    ext,
+                )
+            return None, None
+
+        try:
+            resp = await self.client.get(
+                media_url, timeout=60.0, follow_redirects=True
+            )
+            resp.raise_for_status()
+            data = resp.content
+        except Exception as exc:
+            logger.warning(
+                "[sendblue] media download failed for %s: %s",
+                _redact(media_url),
+                exc,
+            )
+            return None, None
+
+        # Cache the image bytes. cache_image_from_bytes raises ValueError
+        # if the bytes don't look like a valid image (e.g. HTML error page
+        # returned by the CDN). Catch and degrade gracefully.
+        try:
+            local_path = cache_image_from_bytes(data, ext)
+        except ValueError as exc:
+            logger.warning(
+                "[sendblue] media at %s is not a valid image: %s",
+                _redact(media_url),
+                exc,
+            )
+            return None, None
+
+        mime_type = self._ext_to_mime(ext)
+        return local_path, mime_type
+
+    @staticmethod
+    def _ext_to_mime(ext: str) -> str:
+        """Map a file extension to a canonical MIME type.
+
+        Used for image extensions in MVP. Audio/video/document support
+        added when those download branches land in future phases.
+        """
+        ext = ext.lower()
+        if ext == ".jpg" or ext == ".jpeg":
+            return "image/jpeg"
+        if ext == ".png":
+            return "image/png"
+        if ext == ".gif":
+            return "image/gif"
+        if ext == ".webp":
+            return "image/webp"
+        if ext == ".heic":
+            return "image/heic"
+        if ext == ".heif":
+            return "image/heif"
+        return "application/octet-stream"
 
     async def _handle_webhook(self, request):
         """Sendblue webhook handler — stub. Real implementation in step 13.
