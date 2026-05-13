@@ -776,5 +776,106 @@ class SendblueAdapter(BasePlatformAdapter):
 
         return last
 
+    @staticmethod
+    def _is_public_image_url(url: str) -> bool:
+        """Return True if the URL is a public HTTPS image URL.
+
+        Sendblue's media_url field requires:
+          - HTTPS scheme
+          - file extension at URL end (.jpg, .png, etc.)
+          - publicly accessible (no signed URLs)
+
+        We can verify the first two cheaply; the third is detected
+        only at API call time (Sendblue fetches the URL).
+        """
+        if not url or not url.startswith("https://"):
+            return False
+        path = url.split("?")[0]
+        stem = path.rsplit("/", 1)[-1] if "/" in path else path
+        ext = "." + stem.rsplit(".", 1)[-1].lower() if "." in stem else ""
+        return ext in SendblueAdapter._IMAGE_EXTENSIONS
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an image natively via POST /api/send-message with media_url.
+
+        Sendblue fetches the public CDN URL directly -- no upload step
+        on our side. content and media_url are sent in a single payload.
+
+        Requirements (Sendblue API):
+          - image_url must be publicly accessible HTTPS
+          - URL must end with proper file extension (.jpg, .png, etc.)
+          - media_url does NOT support signed URLs (use media upload
+            endpoint for those, deferred post-MVP)
+
+        Falls back to base class URL-as-text via send() if the URL
+        doesn't look like a public image URL. Permissive fallback --
+        better to send a clickable link than to fail.
+
+        reply_to and metadata accepted for interface compatibility but
+        ignored (Sendblue MVP doesn't implement threading).
+        """
+        if not self._is_public_image_url(image_url):
+            logger.debug(
+                "[sendblue] send_image: URL not a public HTTPS image, "
+                "falling back to base class text behavior: %s",
+                image_url[:120],
+            )
+            return await super().send_image(
+                chat_id, image_url, caption, reply_to, metadata
+            )
+
+        if reply_to is not None or metadata:
+            logger.debug(
+                "[sendblue] send_image() ignoring reply_to=%r metadata=%r "
+                "(not implemented in MVP)",
+                reply_to,
+                metadata,
+            )
+
+        # Strip markdown from caption to match send() behavior
+        caption_text = self.format_message(caption) if caption else ""
+
+        payload: Dict[str, Any] = {
+            "number": chat_id,
+            "from_number": self.sendblue_number,
+            "media_url": image_url,
+        }
+        if caption_text:
+            payload["content"] = caption_text
+
+        status, body = await self._sendblue_api_post(
+            "send-message", payload
+        )
+        if not (200 <= status < 300):
+            retryable = (status == 0 or status >= 500)
+            logger.error(
+                "[sendblue] send_image failed status=%d retryable=%s body=%s",
+                status,
+                retryable,
+                body[:200],
+            )
+            return SendResult(
+                success=False,
+                error=f"Sendblue API returned {status}: {body[:200]}",
+                retryable=retryable,
+            )
+        try:
+            parsed = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        msg_id = parsed.get("message_handle") or "ok"
+        return SendResult(
+            success=True,
+            message_id=str(msg_id),
+            raw_response=parsed,
+        )
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "dm"}
