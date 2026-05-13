@@ -38,5 +38,10 @@ class TestSendblueSignatureVerification:
         assert adapter._verify_signature("") is False
 
     def test_no_secret_configured_passes_any_header(self, monkeypatch):
-        adapter = _make_adapter(monkeypatch, webhook_secret="")
+        # _make_adapter sets SENDBLUE_WEBHOOK_SECRET env var, and the adapter's
+        # `webhook_secret or os.getenv(...)` fallback means passing
+        # extra={"webhook_secret": ""} falls through to the env var. Mutate
+        # post-construction to test the "no secret configured" branch.
+        adapter = _make_adapter(monkeypatch)
+        adapter.webhook_secret = ""
         assert adapter._verify_signature("whatever") is True
