@@ -464,8 +464,10 @@ class SendblueAdapter(BasePlatformAdapter):
         Sendblue-specific signature model, flat payload shape, and
         DM-only assumption.
         """
+        from aiohttp import web
+
         # -- STEP 1: Signature verification --
-        secret = request.headers.get(self.SIGNATURE_HEADER, "")
+        secret = request.headers.get(SIGNATURE_HEADER, "")
         if not self._verify_signature(secret):
             logger.warning(
                 "[sendblue] signature verification failed from %s",
