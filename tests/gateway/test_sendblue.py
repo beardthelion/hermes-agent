@@ -335,3 +335,65 @@ class TestSendblueMediaDownload:
         await _drain_background_tasks(adapter)
         assert response.status == 200  # batch succeeds, item silently dropped
         assert adapter.handle_message.call_count == 0
+
+
+class TestSendblueOutboundSend:
+    @pytest.mark.asyncio
+    async def test_send_makes_correct_api_call(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, '{"message_handle": "abc"}')
+        )
+        result = await adapter.send("+17766768883", "hello")
+        assert result.success is True
+        assert result.message_id == "abc"
+        adapter._sendblue_api_post.assert_called_once_with(
+            "send-message",
+            {
+                "number": "+17766768883",
+                "from_number": "+15555550100",
+                "content": "hello",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_truncates_content_over_max_length(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, '{"message_handle": "abc"}')
+        )
+        # 20000 chars > 18996 MAX_MESSAGE_LENGTH — inherited truncate_message
+        # should split into multiple chunks, each POSTed separately
+        result = await adapter.send("+17766768883", "X" * 20000)
+        assert result.success is True
+        assert adapter._sendblue_api_post.call_count > 1
+
+    @pytest.mark.asyncio
+    async def test_empty_content_returns_failure(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock()
+        result = await adapter.send("+17766768883", "")
+        assert result.success is False
+        assert "non-empty" in result.error
+        adapter._sendblue_api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_network_error_returns_retryable_failure(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        # status=0 is the transport-error convention from _sendblue_api_post
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(0, "connection error")
+        )
+        result = await adapter.send("+17766768883", "hello")
+        assert result.success is False
+        assert result.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_4xx_returns_non_retryable_failure(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(400, '{"error": "bad request"}')
+        )
+        result = await adapter.send("+17766768883", "hello")
+        assert result.success is False
+        assert result.retryable is False
