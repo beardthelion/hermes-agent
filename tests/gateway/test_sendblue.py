@@ -1,8 +1,9 @@
 """Tests for the Sendblue iMessage gateway adapter."""
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from gateway.config import Platform, PlatformConfig
@@ -59,6 +60,26 @@ async def _drain_background_tasks(adapter):
         await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
     else:
         await asyncio.sleep(0)
+
+
+class _MockHttpxResponse:
+    """Minimal httpx.Response surface for media download tests.
+
+    Provides .content (bytes payload) and .raise_for_status() (no-op for
+    2xx, raises HTTPStatusError for 4xx/5xx). Enough for the helper to
+    do its happy path and to test error branches.
+    """
+    def __init__(self, content=b"", status_code=200):
+        self.content = content
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"status {self.status_code}",
+                request=httpx.Request("GET", "http://test"),
+                response=self,
+            )
 
 
 class TestSendblueSignatureVerification:
@@ -233,4 +254,84 @@ class TestSendblueWebhookParsing:
         response = await adapter._handle_webhook(request)
         await _drain_background_tasks(adapter)
         assert response.status == 200
+        assert adapter.handle_message.call_count == 0
+
+
+class TestSendblueMediaDownload:
+    @pytest.mark.asyncio
+    async def test_image_url_cached_with_correct_ext(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(
+            return_value=_MockHttpxResponse(content=b"fake-image-bytes")
+        )
+        cache_mock = Mock(return_value="/cache/foo.jpg")
+        monkeypatch.setattr(
+            "gateway.platforms.sendblue.cache_image_from_bytes",
+            cache_mock,
+        )
+        local_path, mime_type = await adapter._download_and_cache_media(
+            "https://cdn.sendblue.com/img/test.jpg"
+        )
+        assert local_path == "/cache/foo.jpg"
+        assert mime_type == "image/jpeg"
+        cache_mock.assert_called_once_with(b"fake-image-bytes", ".jpg")
+
+    @pytest.mark.asyncio
+    async def test_audio_url_warns_and_returns_none(self, monkeypatch, caplog):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()  # client exists, but get won't be called
+        with caplog.at_level("WARNING"):
+            local_path, mime_type = await adapter._download_and_cache_media(
+                "https://cdn.sendblue.com/audio/voice.caf"
+            )
+        assert local_path is None
+        assert mime_type is None
+        adapter.client.get.assert_not_called()  # extension check short-circuits
+        assert any(
+            "audio attachment received" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_download_failure_returns_none(self, monkeypatch, caplog):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(
+            side_effect=httpx.RequestError(
+                "connection refused",
+                request=httpx.Request("GET", "http://test"),
+            )
+        )
+        with caplog.at_level("WARNING"):
+            local_path, mime_type = await adapter._download_and_cache_media(
+                "https://cdn.sendblue.com/img/missing.jpg"
+            )
+        assert local_path is None
+        assert mime_type is None
+        assert any(
+            "media download failed" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_media_only_with_failure_dropped_in_handler(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        # Shallow mock: skip the network and cache layers entirely
+        adapter._download_and_cache_media = AsyncMock(return_value=(None, None))
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            # no content
+            "media_url": "https://cdn.sendblue.com/img/test.jpg",
+        }
+        request = _MockRequest(
+            body=payload,
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200  # batch succeeds, item silently dropped
         assert adapter.handle_message.call_count == 0
