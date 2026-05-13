@@ -327,7 +327,84 @@ class SendblueAdapter(BasePlatformAdapter):
     # -- abstract method stubs (implemented in subsequent steps) --
 
     async def connect(self) -> bool:
-        raise NotImplementedError("connect() not yet implemented")
+        """Connect to Sendblue and start the webhook server.
+
+        See architecture Section 3 for the seven-step sequence.
+        """
+        # Step 1: Preflight validation
+        if not self.api_key_id or not self.api_secret:
+            logger.error(
+                "[sendblue] SENDBLUE_API_KEY_ID and SENDBLUE_API_SECRET are required"
+            )
+            return False
+        if not self.webhook_secret:
+            logger.warning(
+                "[sendblue] SENDBLUE_WEBHOOK_SECRET not set — "
+                "webhook signature verification disabled"
+            )
+        if not self.sendblue_number:
+            logger.warning(
+                "[sendblue] SENDBLUE_NUMBER not set — adapter will process "
+                "ALL inbound messages (no number filter)"
+            )
+
+        # Step 2: HTTP client creation
+        from aiohttp import web
+        from gateway.platforms._http_client_limits import platform_httpx_limits
+        self.client = httpx.AsyncClient(
+            timeout=30.0, limits=platform_httpx_limits()
+        )
+
+        # Step 3: Connectivity check (also pre-fetches webhook list for
+        # step 6's crash-resilience reuse via _register_webhook).
+        try:
+            status, body = await self._sendblue_api_get("account/webhooks")
+            if status != 200:
+                logger.error(
+                    "[sendblue] cannot reach Sendblue API "
+                    "(GET account/webhooks returned status %s): %s",
+                    status,
+                    body,
+                )
+                await self.client.aclose()
+                self.client = None
+                return False
+            masked_key = (
+                f"{self.api_key_id[:6]}…" if len(self.api_key_id) >= 6 else "***"
+            )
+            logger.info(
+                "[sendblue] authenticated to Sendblue API as %s", masked_key
+            )
+        except Exception as exc:
+            logger.error("[sendblue] cannot reach Sendblue API: %s", exc)
+            if self.client:
+                await self.client.aclose()
+                self.client = None
+            return False
+
+        # Step 4: Webhook server startup
+        app = web.Application()
+        app.router.add_get("/health", lambda _: web.Response(text="ok"))
+        app.router.add_post(self.webhook_path, self._handle_webhook)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, self.webhook_host, self.webhook_port)
+        await site.start()
+        logger.info(
+            "[sendblue] webhook listening on http://%s:%s%s",
+            self.webhook_host,
+            self.webhook_port,
+            self.webhook_path,
+        )
+
+        # Step 5: Mark connected
+        self._mark_connected()
+
+        # Step 6: Webhook URL registration (non-fatal on failure)
+        await self._register_webhook()
+
+        # Step 7: Return
+        return True
 
     async def disconnect(self) -> None:
         raise NotImplementedError("disconnect() not yet implemented")
