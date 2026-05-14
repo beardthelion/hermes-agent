@@ -98,11 +98,11 @@ Branch-off decision tree:
 
 ### Sendblue gateway adapter — current state
 
-Branch: feat/sendblue-adapter off production. 25 commits, local-only, not pushed. Latest commit: ac5c1d509 test(gateway/platforms/sendblue): TestSendblueSendImage (final MVP class).
+Merged to production: feat/sendblue-adapter merged via commit 56bf43864 (2026-05-13). 28 commits from feature branch. Currently DISABLED in config.yaml (enabled: false) — bridge is primary. Re-enable by setting enabled: true + restarting gateway.
 
 Files:
 
-- gateway/platforms/sendblue.py — ~881 lines
+- gateway/platforms/sendblue.py — ~883 lines
 - tests/gateway/test_sendblue.py — ~494 lines
 
 MVP code (sessions 1-2, feature complete): all four abstract method bodies real:
@@ -128,7 +128,16 @@ Two latent crashes caught and fixed during Phase B (both would have crashed on f
 
 Phase C arch doc edits complete: 8 original + 4 followup edits. Arch doc at 515 lines, fully synchronized with code through ac5c1d509. No accumulated drift going into next session.
 
-End-to-end verified in earlier sessions: connect() / disconnect() / get_chat_info() work. connect() hit real api.sendblue.com over TLS, 401 cleanly handled. aiohttp webhook server binds port 8665.
+Phase A operational deployment (session 4, 2026-05-13, complete): live round-trip verified.
+
+- config.yaml: sendblue platform block added with credentials from bridge .env (api_key_id, api_secret, sendblue_number, webhook_public_url, webhook_secret)
+- Caddyfile: /sendblue-gateway/* → 127.0.0.1:8665 route added, hot-reloaded
+- Webhook auto-registered via _register_webhook() during connect()
+- Pattern B parallel test confirmed: both bridge and adapter received webhooks, both returned 200, both generated responses
+- Auth fix: SENDBLUE_ALLOWED_USERS=+17706768883 added to ~/.hermes/.env (phone was misrecorded as +17766768883 — 770 not 776)
+- Hermes secret redaction (RedactingFormatter) masks phone numbers in logs, making mismatches invisible. Diagnosed by writing raw bytes to /tmp file to bypass log redactor.
+- systemd unit env vars get silently reverted by gateway's self-update hook (ExecStart --replace rewrites the unit file). Use ~/.hermes/.env for persistent env vars, not the unit file.
+- Adapter disabled after successful test: webhook unregistered from Sendblue, config.yaml enabled: false. Bridge remains primary.
 
 ### BlueBubbles adapter recon notes (reference for Sendblue work)
 
@@ -187,24 +196,25 @@ git diff origin/main is the wrong tool when the branch is far behind upstream. U
 
 ## What Remains To Be Done
 
-### Phase A: operational deployment of Sendblue adapter (next up)
+### Phase A: operational deployment of Sendblue adapter (COMPLETE, adapter currently disabled)
 
-Lowest-stakes-first order:
+Completed 2026-05-13. Live round-trip verified with Pattern B parallel testing. Adapter disabled pending extended dogfooding decision.
 
-1. Confirm adapter env vars are populated in gateway's env:
-- SENDBLUE_NUMBER (NOT bridge's SENDBLUE_FROM_NUMBER — different env var name despite same semantic value)
-- SENDBLUE_API_KEY_ID
-- SENDBLUE_API_SECRET
-- SENDBLUE_WEBHOOK_PUBLIC_URL (full https URL Sendblue POSTs to)
-- SENDBLUE_WEBHOOK_SECRET (per-webhook signing secret — no globalSecret in this Sendblue account)
-2. Caddy route: add to /etc/caddy/Caddyfile:
-   ```
-   handle /sendblue-gateway/* { reverse_proxy 127.0.0.1:8665 }
-   ```
-   Hot-reload: systemctl reload caddy. Path matches the adapter's DEFAULT_WEBHOOK_PATH (`/sendblue-gateway/receive`) and webhook_public_url config.
-3. Sendblue webhook registration (Pattern B parallel testing): adapter's webhook URL registered alongside bridge's existing webhook. Each adapter filters incoming traffic on sendblue_number field. Rollback: DELETE adapter's webhook URL from Sendblue, ~30 seconds.
-4. Cold-start the adapter: bring gateway up with Platform.SENDBLUE in config.py PLATFORMS list. _register_webhook runs during connect(), POSTs the new URL if not already present.
-5. Live round-trip test: real iMessage from iPhone → Sendblue → adapter webhook → agent → adapter send response → back to phone. Verify metrics, logs, absence of weird interactions with the parallel bridge.
+To re-enable the adapter:
+1. In ~/.hermes/config.yaml: set platforms.sendblue.enabled to true
+2. systemctl --user restart hermes-gateway (from SSH, not Telegram)
+3. Adapter's connect() will auto-register webhook URL with Sendblue
+4. Both bridge and adapter will receive traffic (Pattern B dual response)
+
+To cut over (bridge off, adapter only):
+1. Re-enable adapter (steps above)
+2. Unregister bridge webhook: curl -X DELETE with bridge URL from Sendblue /account/webhooks
+3. systemctl stop sendblue-bridge.service
+
+Infrastructure already in place:
+- Caddy route: /sendblue-gateway/* → 127.0.0.1:8665 (already in Caddyfile)
+- Auth: SENDBLUE_ALLOWED_USERS=+17706768883 (already in ~/.hermes/.env)
+- Config: platforms.sendblue block with all credentials (already in config.yaml, just needs enabled: true)
 
 ### Phase D: Tier-2 test backfill (deferred per arch doc Section 8)
 
@@ -288,6 +298,14 @@ If a verification command returns an error or no output, halt at that checkpoint
 Beardy can invoke Claude Code as a separate review agent.
 Findings from that instance get reported back as "Claude's audit" — semantically correct but confusing across conversational instances. When seeing "Claude's audit," recognize it may be Code Claude or another instance, not the conversation Claude. Ask for the raw audit content rather than rejecting the attribution.
 
+### Secret redaction masking debug evidence
+
+Hermes RedactingFormatter redacts phone numbers, API keys, and other secrets in ALL log output. Two different values that share the same redaction pattern (e.g. +17706768883 vs +17766768883 both redact to +177****8883) appear identical in logs. When debugging auth/matching failures, write raw values to a /tmp file to bypass the log redactor. Hit 2026-05-13: SENDBLUE_ALLOWED_USERS mismatch was invisible in journalctl because both the configured and actual phone numbers redacted to the same masked form.
+
+### systemd unit env vars silently reverted by gateway self-update
+
+The gateway's --replace flag rewrites the systemd unit file on startup, stripping any manually-added Environment lines. Use ~/.hermes/.env for persistent env vars — the dotenv loader reads it on every gateway start. Do NOT rely on the systemd unit for custom env vars.
+
 ### Mixed mental models of "filed upstream" vs "deployed locally"
 
 Caused major chaos historically. DEPLOYMENT.md is the safeguard.
@@ -295,6 +313,6 @@ Caused major chaos historically. DEPLOYMENT.md is the safeguard.
 ## Bootstrap Command
 
 At the start of any session resuming this project, run via SSH or send to Beardy:
-cd ~/.hermes/hermes-agent && git checkout feat/sendblue-adapter && git --no-pager log -25 --oneline && git status && git rev-parse --abbrev-ref HEAD && wc -l gateway/platforms/sendblue.py tests/gateway/test_sendblue.py && ./venv/bin/python -m pytest tests/gateway/test_sendblue.py 2>&1 | tail -3
+cd ~/.hermes/hermes-agent && git rev-parse --abbrev-ref HEAD && git --no-pager log -5 --oneline && git status && wc -l gateway/platforms/sendblue.py tests/gateway/test_sendblue.py && ./venv/bin/python -m pytest tests/gateway/test_sendblue.py 2>&1 | tail -3
 
-Expected state: HEAD on feat/sendblue-adapter at ac5c1d509, 25 commits visible, clean working tree, ~881 + ~494 lines, 27 passed in pytest tail.
+Expected state: HEAD on production, clean working tree, ~883 + ~494 lines, 27 passed in pytest tail.
