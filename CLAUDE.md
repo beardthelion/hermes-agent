@@ -1,0 +1,300 @@
+# CLAUDE.md — Hermes Agent + Sendblue Gateway Adapter
+
+This file gives any Claude instance the context needed to operate on this project safely. Read it at the start of every session.
+
+## Operator
+
+Beardy / Beardthelion. Tuscaloosa, AL. AV specialist by day, Bitcoin day trader, building self-hosted AI infrastructure.
+
+Workflow is a relay: Claude proposes, user reviews, Beardy (the Hermes agent on Telegram) applies after greenlight on the VPS, Beardy pastes raw output, user relays to Claude. Path 2 (user direct SSH) is used when verification involves raw output Beardy is likely to summarize.
+
+## Infrastructure
+
+VPS: 129.213.39.57, SSH as ubuntu. Subdomain beard-hermes.duckdns.org.
+
+Hermes: Fork of NousResearch/hermes-agent at github.com/beardthelion/hermes-agent. Deployed at ~/.hermes/hermes-agent. User-systemd-managed via hermes-gateway.service. Deployment branch is production with an ExecStartPre branch gate that refuses to start if the tree is not on production.
+
+Bridge (transitional, being replaced by the gateway adapter): /opt/sendblue-bridge/bridge.py, ~1500+ LOC. NOT a git repo — every edit is production, no rollback. Systemd-managed via sendblue-bridge.service. Bridges Sendblue iMessage webhooks to the Hermes API server. Allowed number: +17706768883. Sendblue from: +16232843671.
+
+## Architecture Overview
+
+### Long-term goal
+
+gateway/platforms/sendblue.py upstream PR to NousResearch/hermes-agent so non-Mac users get iMessage access via Hermes natively. The bridge is transitional. Modeled after the gateway/platforms/bluebubbles.py adapter pattern.
+
+### Current strategy: dogfood gateway-native locally first
+
+Build gateway/platforms/sendblue.py on the production branch, dogfood in parallel with the bridge using Pattern B (both webhook URLs registered with Sendblue, each adapter filters on the sendblue_number field), then file upstream PR after weeks of production validation.
+
+### What transfers from bridge to adapter (Sendblue API specifics)
+
+- Webhook signature verification + inbound message parsing
+- Send-message parameter mapping (content, media_url, send_style)
+- Sendblue CDN media upload (`/media/objects`)
+- Allowed-number validation + rate limit headers
+
+### What gets thrown away (~60% of bridge.py)
+
+Gateway-native plumbing inherits these from base.py:
+
+- Session ID generation, conversation state, SSE streaming, poke dispatch
+- SQLite session overrides, day-suffixed session IDs
+- Auto-recovery, slash command routing, cron broadcast
+- Typing keepalive, progress pokes, silence watchdog
+- /memory, /quota bridge-local commands
+- Voice transcription as hardcoded Groq Whisper (will register Groq STT in plugin system instead)
+- Read receipts / status messages / degraded mode
+
+### Branch model (three-branch pattern)
+
+- main — tracks origin/main, pristine upstream reference. Pulled selectively. Often many commits behind upstream. Never commit directly.
+- production — deployed branch. Local-only changes plus selective upstream merges/cherry-picks. Branch gate enforces hermes-gateway only runs from here.
+- Upstream PR branches (e.g. fix/foo-bar) — branched off origin/main directly so the diff is clean against upstream.
+- Feature branches for local dogfooding (e.g. feat/sendblue-adapter) — branched off production. NOT pushed. Stay local until ready to either merge to production or rebase onto origin/main for upstream PR.
+
+Rule: upstream PR branches awaiting review are NOT merged into production locally. Rebases on maintainer feedback would invalidate any local merge.
+
+Branch-off decision tree:
+
+- Deploying locally → branch off production
+- Filing upstream PR → branch off origin/main (use git checkout -b foo origin/main, not local main)
+
+### Authoritative source of truth
+
+- /opt/sendblue-bridge/DEPLOYMENT.md — what's actually deployed on the bridge. Read at start of every debugging session. Update after every deploy.
+- ~/.hermes/plans/sendblue-adapter-design.md — five design questions resolved.
+- ~/.hermes/plans/sendblue-adapter-architecture.md — eight architectural sections, 515 lines, fully synchronized with code through commit ac5c1d509.
+
+## What's Built So Far
+
+### Bridge-local features (production, work without Hermes changes)
+
+- /memory (reads ~/.hermes/memories/MEMORY.md and USER.md, formatted SMS response with capacity warnings)
+- /quota (Sendblue API usage bar)
+- Voice transcription (Groq Whisper, audio→text in bridge before Hermes sees it)
+- Streaming progress pokes (consumes Hermes SSE, throttled poke phrases for tool events)
+- Session overrides table (SQLite, midnight expiry, persists /compress session rotations)
+- Day-suffixed session IDs (deterministic per phone+date)
+- Typing keepalive (cold-start gap filler, stops when first poke arrives)
+- Status messages, read receipts, degraded-mode fallback
+- Bridge silence watchdog (Track 1a, deployed 2026-05-04): label-aware templated pokes for 9 tools using existing label field in hermes.tool.progress; SSE keepalive watchdog fires "still …" pokes after 30s of tool execution, 60s minimum gap between same-tool keepalives. PokeThrottle is intentionally bypassed in the keepalive branch (`KEEPALIVE_MIN_INTERVAL_SECONDS` is sole gate). DO NOT add `PokeThrottle` back into the keepalive branch.
+- iMessage effects (deployed 2026-05-09): SENDBLUE_DEFAULT_SEND_STYLE env var + send_style param on send_reply() and /admin/broadcast. 13 valid styles validated via frozenset (Sendblue accepts arbitrary strings at API gate — client-side validation is load-bearing). Pokes/system messages stay unstyled by design.
+
+### Upstream features deployed locally
+
+- PR #17178 (slash command base): /help, /new, /reset, /title, /status, /usage, /retry, /undo
+- PR #18512 (slash extras): /profile, /branch, /resume
+- Teknium PR #12969: multimodal content normalization (image meal logging works without #18597)
+
+### Upstream PRs filed by user (awaiting maintainer review, NOT merged to production locally)
+
+- #17136 — PLATFORM_HINTS for api_server
+- #18475 — SessionResetPolicy
+- #18597 — decide_image_input_mode (image works locally via #12969 + vision-capable model)
+- #18975 — audio routing (voice works locally via bridge Groq Whisper)
+- #19041 — /compress (falls through to LLM locally — no api_server handler deployed)
+- #20051 — docs(web_tools) summarizer timeout comment
+- #22828 — feat(api_server) forward tool result fields in hermes.tool.progress completed events. Extensible whitelist pattern (`_TOOL_RESULT_FIELDS`), image_generate → "image" first entry. Follow-up commit a86fcd147 shipped addressing Code Claude audit (key collision guard, size constraints, 2 new tests). 144 tests passing under scripts/run_tests.sh. Prerequisite for outbound media in Sendblue adapter.
+
+### Sendblue gateway adapter — current state
+
+Branch: feat/sendblue-adapter off production. 25 commits, local-only, not pushed. Latest commit: ac5c1d509 test(gateway/platforms/sendblue): TestSendblueSendImage (final MVP class).
+
+Files:
+
+- gateway/platforms/sendblue.py — ~881 lines
+- tests/gateway/test_sendblue.py — ~494 lines
+
+MVP code (sessions 1-2, feature complete): all four abstract method bodies real:
+
+- get_chat_info() — DM stub
+- _handle_webhook() — signature verify, JSON parse, per-item loop
+- send() — markdown strip, multi-bubble split, truncation, per-chunk POST, retryable bifurcation
+- send_image() + _is_public_image_url() — URL passthrough via media_url field, fallback to base class for non-public URLs
+
+Phase B test backfill (session 3, complete): 27 tests across 6 classes, all green via ./venv/bin/python -m pytest tests/gateway/test_sendblue.py:
+
+- TestSendblueSignatureVerification (4 tests)
+- TestSendblueWebhookRouting (3 tests)
+- TestSendblueWebhookParsing (5 tests)
+- TestSendblueMediaDownload (4 tests)
+- TestSendblueOutboundSend (5 tests)
+- TestSendblueSendImage (6 tests)
+
+Two latent crashes caught and fixed during Phase B (both would have crashed on first production webhook in Phase A — B-before-A paid for itself):
+
+- self.SIGNATURE_HEADER at line 468 — constant is module-level. Fixed to bare-name reference.
+- _handle_webhook used web.json_response / web.Response without importing aiohttp.web. Fixed by adding from aiohttp import web inside _handle_webhook matching BB pattern (BB has it at both BB:163 and BB:769).
+
+Phase C arch doc edits complete: 8 original + 4 followup edits. Arch doc at 515 lines, fully synchronized with code through ac5c1d509. No accumulated drift going into next session.
+
+End-to-end verified in earlier sessions: connect() / disconnect() / get_chat_info() work. connect() hit real api.sendblue.com over TLS, 401 cleanly handled. aiohttp webhook server binds port 8665.
+
+### BlueBubbles adapter recon notes (reference for Sendblue work)
+
+gateway/platforms/bluebubbles.py:
+
+- Class: BlueBubblesAdapter(BasePlatformAdapter), platform = Platform.BLUEBUBBLES
+- Required: send(). Optional overrides: send_image, send_voice, send_video, send_document, send_typing, stop_typing, mark_read, get_chat_info, format_message, play_tts, connect, disconnect
+- Inbound media at line 683-741: _download_attachment() → cache_image_from_bytes / cache_audio_from_bytes / cache_document_from_bytes from base.py
+- Cached path reaches agent via MessageEvent(media_urls=...) at line 925 → handle_message()
+- Outbound media: send_image / send_voice / send_video / send_document all route through _send_attachment() at line 461 (multipart upload to `/api/v1/message/attachment`)
+- play_tts not overridden — inherits base default at base.py:1862-1874 which calls self.send_voice()
+- No slash commands implemented — base gateway handles all dispatch
+- No session ID management — base gateway maps chat_id to session_id
+
+### TTS architecture (clarified, locked in)
+
+- text_to_speech is registered in tool registry but NOT in api_server toolset (intentional — Teknium's commit excluded TTS deliberately)
+- auto_tts at base.py:2912-2947 fires only in gateway message-processing pipeline — api_server creates own agents and doesn't participate
+- No "auxiliary call" architecture exists — only the user-tool path
+- Upstream Sendblue adapter (gateway-native) will inherit auto_tts automatically once send_voice is implemented (BlueBubbles uses default play_tts, only overrides `send_voice`)
+
+## Coding Conventions
+
+### Small-step build discipline
+
+One method or helper per step. Cycle: recon → diff → greenlight → apply → verify. No batching multiple methods into one commit. No auto-apply before greenlight.
+
+### Test backfill conventions
+
+- Each test class gets its own commit.
+- Latent bugs caught during test backfill get fixed in the same commit as the test that caught them (combined commit message tells the whole story).
+- Direct pytest is fine for local feature branches: ./venv/bin/python -m pytest tests/gateway/test_sendblue.py -v
+- For upstream contributions, use scripts/run_tests.sh (AGENTS.md mandate — enforces TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0, credentials unset, 4 xdist workers matching GHA ubuntu-latest). Direct pytest on a 16-core dev machine with API keys set diverges from CI.
+
+### Arch doc edits
+
+Write Python script to /tmp, verify with cat -A and ast.parse, back up the doc, run script, diff for review. Don't edit the doc by hand if the change has any structural complexity.
+
+### Commit messages with risky tokens
+
+Write content to /tmp/file.txt, verify with cat -A, use git commit -F /tmp/file.txt. Copy from file directly into browser textareas — don't retype. Hex-escape backticks in printf if other methods fail. Backticks, angle brackets, exclamation marks, double underscores have all been eaten in different rendering layers.
+
+### Diffing against upstream
+
+git diff origin/main is the wrong tool when the branch is far behind upstream. Use git diff $(git merge-base HEAD origin/main) HEAD to see only what the branch added vs the fork point, matching what GitHub displays on the PR page.
+
+### Operational rules (don't undo)
+
+- bridge.py is not versioned. Every edit is production. No rollback.
+- All systemctl ops on hermes-gateway from SSH, not Telegram. Restarting from inside Telegram kills Beardy's own process.
+- Branch gate recovery: cd to repo → git checkout production → systemctl --user reset-failed hermes-gateway.service → systemctl --user start hermes-gateway.service.
+- Connection leak fix at bridge.py line 1189 (try/finally around `_resolve_session_id`). Don't undo.
+- WAL mode + busy_timeout=5000 in get_db(). Don't undo.
+- Bridge silence watchdog: KEEPALIVE_MIN_INTERVAL_SECONDS is sole gate for keepalive timing. PokeThrottle is intentionally bypassed in keepalive branch. Don't undo.
+- After every session: git checkout production before walking away. Branch gate is `ExecStartPre`-only — does not re-check mid-run, but next restart on a non-production branch refuses.
+
+## What Remains To Be Done
+
+### Phase A: operational deployment of Sendblue adapter (next up)
+
+Lowest-stakes-first order:
+
+1. Confirm adapter env vars are populated in gateway's env:
+- SENDBLUE_NUMBER (NOT bridge's SENDBLUE_FROM_NUMBER — different env var name despite same semantic value)
+- SENDBLUE_API_KEY_ID
+- SENDBLUE_API_SECRET
+- SENDBLUE_WEBHOOK_PUBLIC_URL (full https URL Sendblue POSTs to)
+- SENDBLUE_WEBHOOK_SECRET (per-webhook signing secret — no globalSecret in this Sendblue account)
+2. Caddy route: add to /etc/caddy/Caddyfile:
+   ```
+   handle /sendblue-gateway/* { reverse_proxy 127.0.0.1:8665 }
+   ```
+   Hot-reload: systemctl reload caddy. Path matches the adapter's DEFAULT_WEBHOOK_PATH (`/sendblue-gateway/receive`) and webhook_public_url config.
+3. Sendblue webhook registration (Pattern B parallel testing): adapter's webhook URL registered alongside bridge's existing webhook. Each adapter filters incoming traffic on sendblue_number field. Rollback: DELETE adapter's webhook URL from Sendblue, ~30 seconds.
+4. Cold-start the adapter: bring gateway up with Platform.SENDBLUE in config.py PLATFORMS list. _register_webhook runs during connect(), POSTs the new URL if not already present.
+5. Live round-trip test: real iMessage from iPhone → Sendblue → adapter webhook → agent → adapter send response → back to phone. Verify metrics, logs, absence of weird interactions with the parallel bridge.
+
+### Phase D: Tier-2 test backfill (deferred per arch doc Section 8)
+
+Write after weeks of production validation, before upstream PR submission:
+
+- TestSendblueConfigLoading
+- TestSendblueHelpers
+- TestSendblueMessageEvent
+- TestSendblueMessageEventConstruction
+
+### Other pending work
+
+1. Upstream PR #22828 review cycle — maintainer feedback may rebase the branch. Don't merge into production locally. Follow-up commit a86fcd147 already pushed.
+2. Silence watchdog Track 2 (URL-aware progress events) — pending. Plan at ~/.hermes/plans/silence-watchdog-tracks.md. Adds new SSE event types (`hermes.tool.progress` with status: item_started/item_completed/item_failed`) so multi-URL tools emit per-URL progress. Hooks into `tools/web_tools.py:1317 serial loop. Branch off origin/main.
+3. `/memory` upstream PR — pending. Plan at ~/.hermes/plans/native-memory-slash-command-pr1.md. Two PRs: PR1 (CLI + gateway + core API) off origin/main, PR2 (api_server handler) off branch with #17178.
+4. 05:18 branch checkout to main on 2026-05-03 — root cause unidentified. Reflog shows the checkout but no automated cause. Branch gate prevents harm.
+5. `gh` CLI cross-org PR scope — still uses browser workaround. Permanent fix: gh auth refresh -h github.com -s public_repo. Hit again for PR #22828.
+6. Stashed test work-in-progress — git stash@{0} on ~/.hermes/hermes-agent holds tests/gateway/test_api_server_compress.py (369 lines) for #19041 PR2. Also unrelated ui-tui/package-lock.json drift and local scripts parse_oura.py, parse_oura2.py.
+
+## Recurring Patterns
+
+### Beardy operational failure modes
+
+- Verification-summary pattern: Beardy summarizes raw output instead of pasting it. Surfaced 9 times in a single session (2026-05-09 continued). Every instance held to and corrected; every underlying check turned out clean once raw evidence was on the table. Counter: hold every checkpoint regardless of stakes. Cost ~30 seconds; cost of not holding compounds.
+- Fabrication escalation: after tool-call failures, Beardy may claim verification happened that didn't (e.g. asserted PR body saved at /tmp/pr-body.md when no such write occurred).
+- Auto-applies before greenlight. Always demand: show diff first, raw output at boundaries, no auto-apply.
+- Claims existence/non-existence without verification. Always: grep with raw output before accepting.
+- Audit can be wrong while looking confident. Verify with stress test or independent grep.
+- Restarting hermes-gateway from inside Telegram kills Beardy's process. SSH only.
+
+### Path 2 escalation (user direct SSH)
+
+Breaks unreliable verification loops cleanly. Right move when an evidence path has degraded across multiple holds on the same artifact. Cost: 30-60 seconds. Benefit: ground truth, breaks loop, session continues.
+
+### Chat-layer paste corruption
+
+Backticks, angle brackets, exclamation marks, double underscores eaten in different rendering layers. Counter: write to /tmp with cat -A verification, use git commit -F, copy from file directly into browser textareas.
+
+### Terminal-redraw cosmetic (durable, ignore)
+
+Long command echoes wrap visually in SSH terminal, making the echoed command look mangled even when the actual command ran fine. Specifically the heredoc-into-cat-into-tail chain consistently produces visible mangling that does NOT correspond to file content. Verify with git log --format=%B or wc -l after, not by reading the echo.
+
+### Phantom monitor risk
+
+A scheduled job firing on schedule but producing no output is indistinguishable from a healthy system. Always verify monitors with forced failure end-to-end test. Hit 2026-05-03: bridge health check ran 133 silent executions over 11 hours due to paste-corrupted __name__.
+
+### Wrong-interface recon failure
+
+For Hermes-managed resources, use the Hermes tool interface, not bash. Invoking a tool name as a bash command returns empty silently because the name is not a shell command — easy to mistake for "nothing exists." Caused an 11-hour audit gap 2026-05-03.
+
+### Layered recon discipline
+
+When investigating multi-layer systems, report ALL layers even after finding the answer at one. Empty findings are valid evidence and must be reported explicitly.
+
+### Two-gate conflict bug class
+
+When two throttle/gate mechanisms layer over the same call site, the more restrictive wins silently. Walk traces explicitly even on diffs that look obviously correct. Hit 2026-05-04: PokeThrottle's same-tool-coalesce silently killed every keepalive after the first.
+
+### Branch-state drift after upstream PR work
+
+Working tree left on a PR branch after pushing to fork is a latent failure. Branch gate is ExecStartPre-only — next restart refuses with "tree not on production." Hit 2026-05-04: after PR #20051 push, tree stayed on fix/web_extract-timeout-comment. Counter: end every PR-branch session with git checkout production.
+
+### Latent bugs vs exercised code
+
+Two production-crashing bugs sat in _handle_webhook for the entire MVP build phase because no code path exercised them. Test backfill is the intervention that catches this class — by exercising every branch, latent issues surface in test failures rather than production logs. Concrete data point for valuing B-before-A test backfill.
+
+### Claude's own arithmetic errors
+
+Heredoc line-count estimates systematically low by 2-5 lines per step. When numbers don't match expectations, ask for the actual file body — don't escalate to "Beardy added unauthorized content."
+
+### Claude's own substance errors
+
+Sometimes Claude makes a confident claim that's wrong. Counter: recon-on-evidence corrects, holding-on-evidence is healthy, holding-on-prior-claims-when-evidence-refutes-them is rigidity.
+
+### Commit-before-verification near-miss
+
+If a verification command returns an error or no output, halt at that checkpoint and debug before proceeding with the next staged command. Don't let queued commits go through on the strength of an unrun test.
+
+### Audit attribution across Claude instances
+
+Beardy can invoke Claude Code as a separate review agent.
+Findings from that instance get reported back as "Claude's audit" — semantically correct but confusing across conversational instances. When seeing "Claude's audit," recognize it may be Code Claude or another instance, not the conversation Claude. Ask for the raw audit content rather than rejecting the attribution.
+
+### Mixed mental models of "filed upstream" vs "deployed locally"
+
+Caused major chaos historically. DEPLOYMENT.md is the safeguard.
+
+## Bootstrap Command
+
+At the start of any session resuming this project, run via SSH or send to Beardy:
+cd ~/.hermes/hermes-agent && git checkout feat/sendblue-adapter && git --no-pager log -25 --oneline && git status && git rev-parse --abbrev-ref HEAD && wc -l gateway/platforms/sendblue.py tests/gateway/test_sendblue.py && ./venv/bin/python -m pytest tests/gateway/test_sendblue.py 2>&1 | tail -3
+
+Expected state: HEAD on feat/sendblue-adapter at ac5c1d509, 25 commits visible, clean working tree, ~881 + ~494 lines, 27 passed in pytest tail.
