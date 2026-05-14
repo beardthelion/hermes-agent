@@ -1,0 +1,494 @@
+"""Tests for the Sendblue iMessage gateway adapter."""
+import asyncio
+import json
+from unittest.mock import AsyncMock, Mock
+
+import httpx
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+
+
+def _make_adapter(monkeypatch, **extra):
+    monkeypatch.setenv("SENDBLUE_API_KEY_ID", "test-key-id")
+    monkeypatch.setenv("SENDBLUE_API_SECRET", "test-secret")
+    monkeypatch.setenv("SENDBLUE_NUMBER", "+15555550100")
+    monkeypatch.setenv("SENDBLUE_WEBHOOK_SECRET", "test-webhook-secret")
+    from gateway.platforms.sendblue import SendblueAdapter
+
+    cfg = PlatformConfig(
+        enabled=True,
+        extra={
+            "api_key_id": "test-key-id",
+            "api_secret": "test-secret",
+            "sendblue_number": "+15555550100",
+            "webhook_secret": "test-webhook-secret",
+            **extra,
+        },
+    )
+    return SendblueAdapter(cfg)
+
+
+class _MockRequest:
+    """Minimal aiohttp.Request surface for _handle_webhook tests.
+
+    Exposes .headers, .json() async, and .remote. Enough for the handler
+    to do signature check, body parse, and logging — no more. Pass
+    json_error to make .json() raise that exception (used to test the
+    JSONDecodeError → 400 path).
+    """
+    def __init__(self, body=None, headers=None, remote="127.0.0.1", json_error=None):
+        self._body = body
+        self.headers = headers or {}
+        self.remote = remote
+        self._json_error = json_error
+
+    async def json(self):
+        if self._json_error is not None:
+            raise self._json_error
+        return self._body
+
+
+async def _drain_background_tasks(adapter):
+    """Wait for fire-and-forget asyncio.create_task() to settle.
+
+    _handle_webhook does asyncio.create_task(self.handle_message(event))
+    and returns immediately. To assert on handle_message side effects,
+    we need to yield the event loop once for the task to actually run.
+    """
+    if adapter._background_tasks:
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+    else:
+        await asyncio.sleep(0)
+
+
+class _MockHttpxResponse:
+    """Minimal httpx.Response surface for media download tests.
+
+    Provides .content (bytes payload) and .raise_for_status() (no-op for
+    2xx, raises HTTPStatusError for 4xx/5xx). Enough for the helper to
+    do its happy path and to test error branches.
+    """
+    def __init__(self, content=b"", status_code=200):
+        self.content = content
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"status {self.status_code}",
+                request=httpx.Request("GET", "http://test"),
+                response=self,
+            )
+
+
+class TestSendblueSignatureVerification:
+    def test_correct_secret_passes(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, webhook_secret="abc123")
+        assert adapter._verify_signature("abc123") is True
+
+    def test_wrong_secret_fails(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, webhook_secret="abc123")
+        assert adapter._verify_signature("wrong") is False
+
+    def test_empty_header_with_configured_secret_fails(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, webhook_secret="abc123")
+        assert adapter._verify_signature("") is False
+
+    def test_no_secret_configured_passes_any_header(self, monkeypatch):
+        # _make_adapter sets SENDBLUE_WEBHOOK_SECRET env var, and the adapter's
+        # `webhook_secret or os.getenv(...)` fallback means passing
+        # extra={"webhook_secret": ""} falls through to the env var. Mutate
+        # post-construction to test the "no secret configured" branch.
+        adapter = _make_adapter(monkeypatch)
+        adapter.webhook_secret = ""
+        assert adapter._verify_signature("whatever") is True
+
+
+class TestSendblueWebhookRouting:
+    @pytest.mark.asyncio
+    async def test_routes_message_for_configured_number(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)  # SENDBLUE_NUMBER = +15555550100
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            "content": "hello",
+        }
+        request = _MockRequest(
+            body=payload,
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_silently_drops_message_for_other_number(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)  # SENDBLUE_NUMBER = +15555550100
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555559999",  # NOT our number
+            "from_number": "+17766768883",
+            "content": "hello",
+        }
+        request = _MockRequest(
+            body=payload,
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200  # silent — 200 even though dropped
+        assert adapter.handle_message.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_no_number_configured_processes_all(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.sendblue_number = ""  # disable number filter
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555559999",  # any number
+            "from_number": "+17766768883",
+            "content": "hello",
+        }
+        request = _MockRequest(
+            body=payload,
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 1
+
+
+class TestSendblueWebhookParsing:
+    @pytest.mark.asyncio
+    async def test_single_object_normalized_to_list(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            "content": "hello",
+        }
+        request = _MockRequest(
+            body=payload,  # dict, not list
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_array_processed_as_list(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        item = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            "content": "hello",
+        }
+        request = _MockRequest(
+            body=[item, item],  # array of two valid items
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_returns_400(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        request = _MockRequest(
+            json_error=json.JSONDecodeError("expecting value", "", 0),
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 400
+        assert adapter.handle_message.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_from_number_skipped(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            # no from_number
+            "content": "hello",
+        }
+        request = _MockRequest(
+            body=payload,
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        # Item skipped at required-fields check, but batch still succeeds
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_content_skipped(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            # no content, no media_url — no text source at all
+        }
+        request = _MockRequest(
+            body=payload,
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 0
+
+
+class TestSendblueMediaDownload:
+    @pytest.mark.asyncio
+    async def test_image_url_cached_with_correct_ext(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(
+            return_value=_MockHttpxResponse(content=b"fake-image-bytes")
+        )
+        cache_mock = Mock(return_value="/cache/foo.jpg")
+        monkeypatch.setattr(
+            "gateway.platforms.sendblue.cache_image_from_bytes",
+            cache_mock,
+        )
+        local_path, mime_type = await adapter._download_and_cache_media(
+            "https://cdn.sendblue.com/img/test.jpg"
+        )
+        assert local_path == "/cache/foo.jpg"
+        assert mime_type == "image/jpeg"
+        cache_mock.assert_called_once_with(b"fake-image-bytes", ".jpg")
+
+    @pytest.mark.asyncio
+    async def test_audio_url_warns_and_returns_none(self, monkeypatch, caplog):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()  # client exists, but get won't be called
+        with caplog.at_level("WARNING"):
+            local_path, mime_type = await adapter._download_and_cache_media(
+                "https://cdn.sendblue.com/audio/voice.caf"
+            )
+        assert local_path is None
+        assert mime_type is None
+        adapter.client.get.assert_not_called()  # extension check short-circuits
+        assert any(
+            "audio attachment received" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_download_failure_returns_none(self, monkeypatch, caplog):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(
+            side_effect=httpx.RequestError(
+                "connection refused",
+                request=httpx.Request("GET", "http://test"),
+            )
+        )
+        with caplog.at_level("WARNING"):
+            local_path, mime_type = await adapter._download_and_cache_media(
+                "https://cdn.sendblue.com/img/missing.jpg"
+            )
+        assert local_path is None
+        assert mime_type is None
+        assert any(
+            "media download failed" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_media_only_with_failure_dropped_in_handler(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        # Shallow mock: skip the network and cache layers entirely
+        adapter._download_and_cache_media = AsyncMock(return_value=(None, None))
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            # no content
+            "media_url": "https://cdn.sendblue.com/img/test.jpg",
+        }
+        request = _MockRequest(
+            body=payload,
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200  # batch succeeds, item silently dropped
+        assert adapter.handle_message.call_count == 0
+
+
+class TestSendblueOutboundSend:
+    @pytest.mark.asyncio
+    async def test_send_makes_correct_api_call(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, '{"message_handle": "abc"}')
+        )
+        result = await adapter.send("+17766768883", "hello")
+        assert result.success is True
+        assert result.message_id == "abc"
+        adapter._sendblue_api_post.assert_called_once_with(
+            "send-message",
+            {
+                "number": "+17766768883",
+                "from_number": "+15555550100",
+                "content": "hello",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_truncates_content_over_max_length(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, '{"message_handle": "abc"}')
+        )
+        # 20000 chars > 18996 MAX_MESSAGE_LENGTH — inherited truncate_message
+        # should split into multiple chunks, each POSTed separately
+        result = await adapter.send("+17766768883", "X" * 20000)
+        assert result.success is True
+        assert adapter._sendblue_api_post.call_count > 1
+
+    @pytest.mark.asyncio
+    async def test_empty_content_returns_failure(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock()
+        result = await adapter.send("+17766768883", "")
+        assert result.success is False
+        assert "non-empty" in result.error
+        adapter._sendblue_api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_network_error_returns_retryable_failure(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        # status=0 is the transport-error convention from _sendblue_api_post
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(0, "connection error")
+        )
+        result = await adapter.send("+17766768883", "hello")
+        assert result.success is False
+        assert result.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_4xx_returns_non_retryable_failure(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(400, '{"error": "bad request"}')
+        )
+        result = await adapter.send("+17766768883", "hello")
+        assert result.success is False
+        assert result.retryable is False
+
+
+class TestSendblueSendImage:
+    def test_public_image_url_truth_table(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        # Public HTTPS image URLs -> True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.jpg") is True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.png") is True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.JPG") is True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.heic") is True
+        assert adapter._is_public_image_url("https://cdn.example.com/img.jpg?token=abc") is True
+
+    def test_non_public_url_truth_table(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        # Non-HTTPS or no/wrong extension -> False
+        assert adapter._is_public_image_url("http://cdn.example.com/img.jpg") is False
+        assert adapter._is_public_image_url("file:///tmp/img.jpg") is False
+        assert adapter._is_public_image_url("https://cdn.example.com/img.txt") is False
+        assert adapter._is_public_image_url("https://cdn.example.com/noext") is False
+        assert adapter._is_public_image_url("") is False
+        assert adapter._is_public_image_url("not-a-url") is False
+
+    @pytest.mark.asyncio
+    async def test_public_image_sends_with_media_url(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, '{"message_handle": "img-abc"}')
+        )
+        result = await adapter.send_image(
+            "+17766768883",
+            "https://cdn.example.com/img.jpg",
+            caption=None,
+        )
+        assert result.success is True
+        assert result.message_id == "img-abc"
+        adapter._sendblue_api_post.assert_called_once_with(
+            "send-message",
+            {
+                "number": "+17766768883",
+                "from_number": "+15555550100",
+                "media_url": "https://cdn.example.com/img.jpg",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_public_image_with_caption_includes_content(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, '{"message_handle": "img-xyz"}')
+        )
+        result = await adapter.send_image(
+            "+17766768883",
+            "https://cdn.example.com/img.jpg",
+            caption="look at this",
+        )
+        assert result.success is True
+        adapter._sendblue_api_post.assert_called_once_with(
+            "send-message",
+            {
+                "number": "+17766768883",
+                "from_number": "+15555550100",
+                "media_url": "https://cdn.example.com/img.jpg",
+                "content": "look at this",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_public_url_falls_back_to_base_class(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock()  # should not be called
+        super_send_image = AsyncMock()
+        monkeypatch.setattr(
+            "gateway.platforms.base.BasePlatformAdapter.send_image",
+            super_send_image,
+        )
+        await adapter.send_image(
+            "+17766768883",
+            "http://cdn.example.com/img.jpg",  # http, not https
+            caption="hi",
+        )
+        super_send_image.assert_called_once()
+        adapter._sendblue_api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_4xx_returns_non_retryable_failure(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(400, '{"error": "invalid media_url"}')
+        )
+        result = await adapter.send_image(
+            "+17766768883",
+            "https://cdn.example.com/img.jpg",
+        )
+        assert result.success is False
+        assert result.retryable is False
