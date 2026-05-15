@@ -638,3 +638,103 @@ class TestSendblueReadReceiptsAndTyping:
         assert response.status == 200
         await _drain_background_tasks(adapter)
         adapter.mark_read.assert_called_once_with("+17766768883")
+
+
+class TestSendblueSendStyle:
+    def test_normalize_valid_style_lowercased(self, monkeypatch):
+        from gateway.platforms.sendblue import _normalize_send_style
+        assert _normalize_send_style("Confetti") == "confetti"
+        assert _normalize_send_style("  GENTLE  ") == "gentle"
+
+    def test_normalize_none_and_empty(self, monkeypatch):
+        from gateway.platforms.sendblue import _normalize_send_style
+        assert _normalize_send_style(None) is None
+        assert _normalize_send_style("") is None
+        assert _normalize_send_style("   ") is None
+
+    def test_normalize_invalid_returns_none_and_warns(self, monkeypatch, caplog):
+        from gateway.platforms.sendblue import _normalize_send_style
+        with caplog.at_level("WARNING"):
+            assert _normalize_send_style("nuclear") is None
+        assert any("invalid send_style" in r.message for r in caplog.records)
+
+    def test_default_style_from_env(self, monkeypatch):
+        monkeypatch.setenv("SENDBLUE_DEFAULT_SEND_STYLE", "confetti")
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.default_send_style == "confetti"
+
+    def test_default_style_from_extra_overrides_env(self, monkeypatch):
+        monkeypatch.setenv("SENDBLUE_DEFAULT_SEND_STYLE", "confetti")
+        adapter = _make_adapter(monkeypatch, sendblue_default_send_style="slam")
+        assert adapter.default_send_style == "slam"
+
+    def test_default_style_invalid_env_is_dropped(self, monkeypatch, caplog):
+        monkeypatch.setenv("SENDBLUE_DEFAULT_SEND_STYLE", "nuclear")
+        with caplog.at_level("WARNING"):
+            adapter = _make_adapter(monkeypatch)
+        assert adapter.default_send_style is None
+
+    @pytest.mark.asyncio
+    async def test_send_includes_default_style(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, sendblue_default_send_style="confetti")
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        await adapter.send("+17706768883", "hi")
+        sent_payload = adapter._sendblue_api_post.call_args[0][1]
+        assert sent_payload["send_style"] == "confetti"
+
+    @pytest.mark.asyncio
+    async def test_send_no_style_when_default_unset(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        await adapter.send("+17706768883", "hi")
+        sent_payload = adapter._sendblue_api_post.call_args[0][1]
+        assert "send_style" not in sent_payload
+
+    @pytest.mark.asyncio
+    async def test_send_metadata_overrides_default(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, sendblue_default_send_style="confetti")
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        await adapter.send("+17706768883", "hi", metadata={"send_style": "slam"})
+        sent_payload = adapter._sendblue_api_post.call_args[0][1]
+        assert sent_payload["send_style"] == "slam"
+
+    @pytest.mark.asyncio
+    async def test_send_metadata_none_suppresses_default(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, sendblue_default_send_style="confetti")
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        await adapter.send("+17706768883", "hi", metadata={"send_style": None})
+        sent_payload = adapter._sendblue_api_post.call_args[0][1]
+        assert "send_style" not in sent_payload
+
+    @pytest.mark.asyncio
+    async def test_send_invalid_metadata_style_dropped(self, monkeypatch, caplog):
+        adapter = _make_adapter(monkeypatch, sendblue_default_send_style="confetti")
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        with caplog.at_level("WARNING"):
+            await adapter.send("+17706768883", "hi", metadata={"send_style": "nuclear"})
+        sent_payload = adapter._sendblue_api_post.call_args[0][1]
+        assert "send_style" not in sent_payload
+
+    @pytest.mark.asyncio
+    async def test_send_image_includes_style(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, sendblue_default_send_style="balloons")
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        await adapter.send_image(
+            "+17706768883", "https://example.com/a.png", caption="cap"
+        )
+        sent_payload = adapter._sendblue_api_post.call_args[0][1]
+        assert sent_payload["send_style"] == "balloons"
+        assert sent_payload["media_url"] == "https://example.com/a.png"
+        assert sent_payload["content"] == "cap"

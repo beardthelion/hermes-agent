@@ -49,6 +49,35 @@ MAX_TEXT_LENGTH = 18996
 SIGNATURE_HEADER = "sb-signing-secret"
 SENDBLUE_API_BASE = "https://api.sendblue.com/api"
 
+# iMessage send effects accepted by POST /api/send-message. Sendblue does
+# not validate server-side — arbitrary strings are accepted with HTTP 202
+# and silently dropped on the recipient side. This frozenset is the only
+# validation gate, so keep it in sync with Sendblue's docs.
+VALID_SEND_STYLES = frozenset({
+    "slam", "loud", "gentle", "invisible", "echo", "spotlight",
+    "balloons", "confetti", "love", "lasers", "fireworks",
+    "shooting_star", "celebration",
+})
+
+
+def _normalize_send_style(style: Optional[str]) -> Optional[str]:
+    """Return a lowercased valid send_style, or None.
+
+    None/empty/whitespace → None (caller should drop the field).
+    Unknown style → logs WARNING and returns None (graceful degrade —
+    Sendblue would accept it silently otherwise).
+    """
+    if not style or not isinstance(style, str) or not style.strip():
+        return None
+    s = style.strip().lower()
+    if s not in VALID_SEND_STYLES:
+        logger.warning(
+            "[sendblue] invalid send_style %r — dropping. Valid: %s",
+            style, ", ".join(sorted(VALID_SEND_STYLES)),
+        )
+        return None
+    return s
+
 # Log redaction patterns
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
@@ -124,6 +153,10 @@ class SendblueAdapter(BasePlatformAdapter):
         self.daily_cap = int(
             extra.get("sendblue_daily_cap") or os.getenv("SENDBLUE_DAILY_CAP", "200")
         )
+        self.default_send_style = _normalize_send_style(
+            extra.get("sendblue_default_send_style")
+            or os.getenv("SENDBLUE_DEFAULT_SEND_STYLE", "")
+        )
         self._quota_cache: Dict[str, Dict[str, Any]] = {}
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
@@ -131,6 +164,19 @@ class SendblueAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # API helpers
     # ------------------------------------------------------------------
+
+    def _resolve_send_style(
+        self, metadata: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Pick the send_style for this call.
+
+        Precedence: per-call metadata["send_style"] > self.default_send_style.
+        Explicit metadata["send_style"]=None or "" forces no style even
+        when a default is configured (caller wins).
+        """
+        if metadata is not None and "send_style" in metadata:
+            return _normalize_send_style(metadata.get("send_style"))
+        return self.default_send_style
 
     def _build_api_headers(self) -> Dict[str, str]:
         """Build the standard Sendblue API auth headers."""
@@ -820,13 +866,14 @@ class SendblueAdapter(BasePlatformAdapter):
         compatibility but currently ignored -- Sendblue MVP does not
         implement message threading.
         """
-        if reply_to is not None or metadata:
+        if reply_to is not None:
             logger.debug(
-                "[sendblue] send() ignoring reply_to=%r metadata=%r "
+                "[sendblue] send() ignoring reply_to=%r "
                 "(not implemented in MVP)",
                 reply_to,
-                metadata,
             )
+
+        send_style = self._resolve_send_style(metadata)
 
         text = self.format_message(content)
         if not text:
@@ -863,6 +910,8 @@ class SendblueAdapter(BasePlatformAdapter):
                 "from_number": self.sendblue_number,
                 "content": chunk,
             }
+            if send_style:
+                payload["send_style"] = send_style
             status, body = await self._sendblue_api_post(
                 "send-message", payload
             )
@@ -947,13 +996,14 @@ class SendblueAdapter(BasePlatformAdapter):
                 chat_id, image_url, caption, reply_to, metadata
             )
 
-        if reply_to is not None or metadata:
+        if reply_to is not None:
             logger.debug(
-                "[sendblue] send_image() ignoring reply_to=%r metadata=%r "
+                "[sendblue] send_image() ignoring reply_to=%r "
                 "(not implemented in MVP)",
                 reply_to,
-                metadata,
             )
+
+        send_style = self._resolve_send_style(metadata)
 
         # Strip markdown from caption to match send() behavior
         caption_text = self.format_message(caption) if caption else ""
@@ -965,6 +1015,8 @@ class SendblueAdapter(BasePlatformAdapter):
         }
         if caption_text:
             payload["content"] = caption_text
+        if send_style:
+            payload["send_style"] = send_style
 
         status, body = await self._sendblue_api_post(
             "send-message", payload
