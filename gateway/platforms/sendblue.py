@@ -16,8 +16,9 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -120,6 +121,10 @@ class SendblueAdapter(BasePlatformAdapter):
         )
         self.send_read_receipts = bool(extra.get("send_read_receipts", True))
         self.multi_bubble_split = bool(extra.get("multi_bubble_split", False))
+        self.daily_cap = int(
+            extra.get("sendblue_daily_cap") or os.getenv("SENDBLUE_DAILY_CAP", "200")
+        )
+        self._quota_cache: Dict[str, Dict[str, Any]] = {}
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
 
@@ -326,6 +331,98 @@ class SendblueAdapter(BasePlatformAdapter):
                 "[sendblue] webhook unregistration failed (non-critical): %s", exc
             )
             return False
+
+    # ------------------------------------------------------------------
+    # Quota / usage tracking (/quota slash command)
+    # ------------------------------------------------------------------
+
+    _QUOTA_CACHE_TTL_SECONDS = 60
+
+    @staticmethod
+    def _get_sendblue_day_key() -> str:
+        """Sendblue daily quota resets at 3am America/New_York.
+
+        Returns ISO timestamp of the current day's window start. Before
+        3am EST/EDT the window started 3am the previous day.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+        tz = ZoneInfo("America/New_York")
+        now = datetime.now(tz)
+        cutoff = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if now < cutoff:
+            cutoff -= timedelta(days=1)
+        return cutoff.isoformat()
+
+    async def _fetch_sendblue_usage(self) -> Dict[str, Any]:
+        """Count today's outbound + inbound messages via Sendblue API.
+
+        Cached 60s keyed on the 3am EST day boundary. On API failure
+        returns stale cache if available, else an error-marker dict.
+        """
+        day_key = self._get_sendblue_day_key()
+        cached = self._quota_cache.get(day_key)
+        if cached and (time.time() - cached["cached_at"]) < self._QUOTA_CACHE_TTL_SECONDS:
+            return {**cached["data"], "source": "cache"}
+
+        try:
+            status, data = await self._sendblue_api_get(
+                "messages",
+                {"is_outbound": "true", "created_at_gte": day_key, "limit": 1},
+                timeout=3.0,
+            )
+            if status != 200:
+                raise RuntimeError(f"HTTP {status}: {str(data)[:200]}")
+            outbound = data.get("pagination", {}).get("total", 0)
+
+            status, data = await self._sendblue_api_get(
+                "messages",
+                {"is_outbound": "false", "created_at_gte": day_key, "limit": 1},
+                timeout=3.0,
+            )
+            if status != 200:
+                raise RuntimeError(f"HTTP {status}: {str(data)[:200]}")
+            inbound = data.get("pagination", {}).get("total", 0)
+
+            result = {
+                "outbound": outbound,
+                "inbound": inbound,
+                "day_key": day_key,
+                "source": "Sendblue API",
+                "error": None,
+            }
+            self._quota_cache[day_key] = {"data": result, "cached_at": time.time()}
+            return result
+        except Exception as e:
+            err = str(e)[:200]
+            logger.warning("[sendblue] usage fetch failed: %s", err)
+            stale = self._quota_cache.get(day_key)
+            if stale:
+                return {**stale["data"], "source": "stale cache", "error": err}
+            return {
+                "outbound": 0,
+                "inbound": 0,
+                "day_key": day_key,
+                "source": "error",
+                "error": err,
+            }
+
+    def _format_quota_response(self, usage: Dict[str, Any]) -> str:
+        """Build /quota SMS reply from _fetch_sendblue_usage() output."""
+        outbound = usage.get("outbound", 0)
+        inbound = usage.get("inbound", 0)
+        cap = self.daily_cap
+        pct = min(100, int((outbound / cap) * 100)) if cap > 0 else 0
+        bar_width = 8
+        filled = max(0, min(bar_width, int(round((pct / 100) * bar_width))))
+        bar = "█" * filled + "░" * (bar_width - filled)
+        return "\n".join([
+            "📊 Sendblue (since 3am EST)",
+            f"↑ {outbound} sent / {cap} daily cap  [{bar}] {pct}%",
+            f"↓ {inbound} received",
+        ])
 
     @staticmethod
     def _value(*candidates: Any) -> Optional[str]:
@@ -545,6 +642,23 @@ class SendblueAdapter(BasePlatformAdapter):
                     from_number,
                     bool(text),
                 )
+                continue
+
+            # -- STEP 3f.5: Platform-native slash command intercept --
+            if text.strip().lower() == "/quota":
+                async def _send_quota_reply(target=from_number):
+                    try:
+                        usage = await self._fetch_sendblue_usage()
+                        reply = self._format_quota_response(usage)
+                    except Exception as exc:
+                        logger.exception(
+                            "[sendblue] /quota handler failed: %s", exc
+                        )
+                        reply = "Couldn't fetch Sendblue usage — try again?"
+                    await self.send(target, reply)
+                task = asyncio.create_task(_send_quota_reply())
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
                 continue
 
             # -- STEP 3g: Build MessageEvent --

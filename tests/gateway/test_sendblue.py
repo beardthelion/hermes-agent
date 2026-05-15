@@ -492,3 +492,89 @@ class TestSendblueSendImage:
         )
         assert result.success is False
         assert result.retryable is False
+
+
+class TestSendblueQuotaCommand:
+    def test_format_zero_outbound(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        out = adapter._format_quota_response({"outbound": 0, "inbound": 5})
+        assert out.startswith("📊 Sendblue (since 3am EST)")
+        assert "↑ 0 sent / 200 daily cap" in out
+        assert "[░░░░░░░░] 0%" in out
+        assert "↓ 5 received" in out
+
+    def test_format_at_cap(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        out = adapter._format_quota_response({"outbound": 200, "inbound": 0})
+        assert "[████████] 100%" in out
+        assert "↑ 200 sent / 200 daily cap" in out
+
+    def test_format_custom_cap(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, sendblue_daily_cap=500)
+        out = adapter._format_quota_response({"outbound": 250, "inbound": 0})
+        assert "/ 500 daily cap" in out
+        assert "50%" in out
+        assert "[████░░░░]" in out
+
+    @pytest.mark.asyncio
+    async def test_fetch_usage_happy_path(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_get = AsyncMock(side_effect=[
+            (200, {"pagination": {"total": 42}}),
+            (200, {"pagination": {"total": 17}}),
+        ])
+        result = await adapter._fetch_sendblue_usage()
+        assert result["outbound"] == 42
+        assert result["inbound"] == 17
+        assert result["source"] == "Sendblue API"
+        assert adapter._sendblue_api_get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_fetch_usage_cache_hit(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_get = AsyncMock(side_effect=[
+            (200, {"pagination": {"total": 5}}),
+            (200, {"pagination": {"total": 3}}),
+        ])
+        first = await adapter._fetch_sendblue_usage()
+        second = await adapter._fetch_sendblue_usage()
+        assert second["outbound"] == 5
+        assert second["source"] == "cache"
+        assert adapter._sendblue_api_get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_fetch_usage_api_error_no_cache(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_get = AsyncMock(return_value=(500, "server error"))
+        result = await adapter._fetch_sendblue_usage()
+        assert result["source"] == "error"
+        assert "500" in (result.get("error") or "")
+        assert result["outbound"] == 0
+
+    @pytest.mark.asyncio
+    async def test_quota_intercept_short_circuits_agent(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._fetch_sendblue_usage = AsyncMock(return_value={
+            "outbound": 10, "inbound": 5, "day_key": "x",
+            "source": "Sendblue API", "error": None,
+        })
+        adapter.send = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17766768883",
+                "content": "/quota",
+                "message_handle": "abc",
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        assert response.status == 200
+        await _drain_background_tasks(adapter)
+        adapter._fetch_sendblue_usage.assert_called_once()
+        adapter.send.assert_called_once()
+        sent_content = adapter.send.call_args[0][1]
+        assert "📊 Sendblue" in sent_content
+        adapter.handle_message.assert_not_called()
