@@ -1003,31 +1003,42 @@ class SendblueAdapter(BasePlatformAdapter):
                 reply_to,
             )
 
-        send_style = self._resolve_send_style(metadata)
+        return await self._send_with_media_url(
+            chat_id, image_url, caption, metadata,
+        )
 
-        # Strip markdown from caption to match send() behavior
+    async def _send_with_media_url(
+        self,
+        chat_id: str,
+        media_url: str,
+        caption: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """POST /api/send-message with a media_url attachment.
+
+        Shared body of send_image (URL passthrough) and the upload-then-
+        send media methods (send_image_file, send_voice, etc.). Strips
+        markdown from caption and applies send_style precedence.
+        """
+        send_style = self._resolve_send_style(metadata)
         caption_text = self.format_message(caption) if caption else ""
 
         payload: Dict[str, Any] = {
             "number": chat_id,
             "from_number": self.sendblue_number,
-            "media_url": image_url,
+            "media_url": media_url,
         }
         if caption_text:
             payload["content"] = caption_text
         if send_style:
             payload["send_style"] = send_style
 
-        status, body = await self._sendblue_api_post(
-            "send-message", payload
-        )
+        status, body = await self._sendblue_api_post("send-message", payload)
         if not (200 <= status < 300):
             retryable = (status == 0 or status >= 500)
             logger.error(
-                "[sendblue] send_image failed status=%d retryable=%s body=%s",
-                status,
-                retryable,
-                body[:200],
+                "[sendblue] media send failed status=%d retryable=%s body=%s",
+                status, retryable, body[:200],
             )
             return SendResult(
                 success=False,
@@ -1040,9 +1051,186 @@ class SendblueAdapter(BasePlatformAdapter):
             parsed = {}
         msg_id = parsed.get("message_handle") or "ok"
         return SendResult(
-            success=True,
-            message_id=str(msg_id),
-            raw_response=parsed,
+            success=True, message_id=str(msg_id), raw_response=parsed,
+        )
+
+    async def _upload_file_to_sendblue(
+        self, file_path: str
+    ) -> Optional[str]:
+        """Upload a local file to Sendblue's CDN.
+
+        POST /api/upload-file (multipart). Returns the media_url on
+        success, None on failure. The returned URL is then passed as
+        media_url to /api/send-message.
+
+        100 MB limit per Sendblue API. Filename + extension are
+        preserved on the CDN — pass a .caf file to get native iMessage
+        voice-memo rendering on the recipient device.
+        """
+        if self.client is None:
+            logger.error("[sendblue] _upload_file_to_sendblue called before connect()")
+            return None
+        if not os.path.isfile(file_path):
+            logger.error("[sendblue] upload: file not found: %s", file_path)
+            return None
+
+        url = f"{SENDBLUE_API_BASE}/upload-file"
+        fname = os.path.basename(file_path)
+        try:
+            with open(file_path, "rb") as f:
+                # httpx multipart: pass files as field-name -> (filename, fileobj)
+                files = {"file": (fname, f, "application/octet-stream")}
+                # Don't include Content-Type from _build_api_headers — httpx
+                # sets multipart boundary itself.
+                headers = {
+                    "sb-api-key-id": self.api_key_id,
+                    "sb-api-secret-key": self.api_secret,
+                }
+                resp = await self.client.post(
+                    url, files=files, headers=headers, timeout=120.0,
+                )
+        except httpx.TimeoutException:
+            logger.warning("[sendblue] upload timeout for %s", fname)
+            return None
+        except Exception as exc:
+            logger.error("[sendblue] upload error for %s: %s", fname, exc)
+            return None
+
+        if not (200 <= resp.status_code < 300):
+            logger.error(
+                "[sendblue] upload returned status %d: %s",
+                resp.status_code, resp.text[:200],
+            )
+            return None
+        try:
+            parsed = resp.json()
+        except Exception:
+            logger.error(
+                "[sendblue] upload response not JSON: %s", resp.text[:200],
+            )
+            return None
+        media_url = parsed.get("media_url")
+        if not media_url:
+            logger.error(
+                "[sendblue] upload response missing media_url: %s",
+                str(parsed)[:200],
+            )
+            return None
+        return media_url
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local image file via Sendblue CDN upload + send-message."""
+        media_url = await self._upload_file_to_sendblue(image_path)
+        if not media_url:
+            return SendResult(
+                success=False,
+                error=f"Sendblue upload failed for {image_path}",
+                retryable=True,
+            )
+        return await self._send_with_media_url(
+            chat_id, media_url, caption, kwargs.get("metadata"),
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send an audio file as an iMessage attachment.
+
+        For native voice-memo rendering on the recipient device, the
+        file MUST have a .caf extension (Sendblue uses the extension
+        to decide voice-bubble vs generic-attachment rendering).
+        Non-.caf audio is uploaded as a generic attachment with a
+        DEBUG log.
+        """
+        ext = os.path.splitext(audio_path)[1].lower()
+        if ext != ".caf":
+            logger.debug(
+                "[sendblue] send_voice: %s is not .caf — will render as "
+                "generic attachment, not voice memo",
+                ext or "(no ext)",
+            )
+        media_url = await self._upload_file_to_sendblue(audio_path)
+        if not media_url:
+            return SendResult(
+                success=False,
+                error=f"Sendblue upload failed for {audio_path}",
+                retryable=True,
+            )
+        return await self._send_with_media_url(
+            chat_id, media_url, caption, kwargs.get("metadata"),
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local video file via Sendblue CDN upload + send-message."""
+        media_url = await self._upload_file_to_sendblue(video_path)
+        if not media_url:
+            return SendResult(
+                success=False,
+                error=f"Sendblue upload failed for {video_path}",
+                retryable=True,
+            )
+        return await self._send_with_media_url(
+            chat_id, media_url, caption, kwargs.get("metadata"),
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send any file as an iMessage attachment.
+
+        file_name is accepted for interface parity with BlueBubbles but
+        ignored — Sendblue's upload uses the on-disk filename.
+        """
+        media_url = await self._upload_file_to_sendblue(file_path)
+        if not media_url:
+            return SendResult(
+                success=False,
+                error=f"Sendblue upload failed for {file_path}",
+                retryable=True,
+            )
+        return await self._send_with_media_url(
+            chat_id, media_url, caption, kwargs.get("metadata"),
+        )
+
+    async def send_animation(
+        self,
+        chat_id: str,
+        animation_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an animated image (GIF). Mirrors BlueBubbles' behavior of
+        delegating to send_image — Sendblue treats .gif identically to
+        static images on the CDN.
+        """
+        return await self.send_image(
+            chat_id, animation_url, caption, reply_to, metadata,
         )
 
     async def mark_read(self, chat_id: str) -> bool:

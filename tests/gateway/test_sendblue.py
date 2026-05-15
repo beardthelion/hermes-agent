@@ -738,3 +738,201 @@ class TestSendblueSendStyle:
         assert sent_payload["send_style"] == "balloons"
         assert sent_payload["media_url"] == "https://example.com/a.png"
         assert sent_payload["content"] == "cap"
+
+
+class _MockUploadResponse:
+    """Minimal httpx.Response surface for upload_file tests."""
+    def __init__(self, status_code=200, body=None, raise_on_json=False):
+        self.status_code = status_code
+        self._body = body or {}
+        self._raise_on_json = raise_on_json
+        self.text = json.dumps(self._body) if not raise_on_json else "not json"
+
+    def json(self):
+        if self._raise_on_json:
+            raise ValueError("not json")
+        return self._body
+
+
+class TestSendblueMediaUpload:
+    @pytest.mark.asyncio
+    async def test_upload_file_happy_path(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        adapter.client = AsyncMock()
+        adapter.client.post = AsyncMock(
+            return_value=_MockUploadResponse(
+                200, {"media_url": "https://cdn.sb/abc.png"}
+            )
+        )
+        media_url = await adapter._upload_file_to_sendblue(str(f))
+        assert media_url == "https://cdn.sb/abc.png"
+        # Verify multipart was used (files= kwarg present)
+        _, kwargs = adapter.client.post.call_args
+        assert "files" in kwargs
+        assert kwargs["headers"]["sb-api-key-id"] == "test-key-id"
+        # Content-Type NOT injected (httpx sets multipart boundary itself)
+        assert "Content-Type" not in kwargs["headers"]
+
+    @pytest.mark.asyncio
+    async def test_upload_file_missing_returns_none(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        result = await adapter._upload_file_to_sendblue("/no/such/file.png")
+        assert result is None
+        adapter.client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_upload_file_http_error_returns_none(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"data")
+        adapter.client = AsyncMock()
+        adapter.client.post = AsyncMock(
+            return_value=_MockUploadResponse(500, {"error": "boom"})
+        )
+        assert await adapter._upload_file_to_sendblue(str(f)) is None
+
+    @pytest.mark.asyncio
+    async def test_upload_file_no_media_url_returns_none(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"data")
+        adapter.client = AsyncMock()
+        adapter.client.post = AsyncMock(
+            return_value=_MockUploadResponse(200, {"status": "OK"})  # no media_url
+        )
+        assert await adapter._upload_file_to_sendblue(str(f)) is None
+
+    @pytest.mark.asyncio
+    async def test_upload_file_timeout_returns_none(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"data")
+        adapter.client = AsyncMock()
+        adapter.client.post = AsyncMock(side_effect=httpx.TimeoutException("slow"))
+        assert await adapter._upload_file_to_sendblue(str(f)) is None
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_uploads_then_sends(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"data")
+        adapter._upload_file_to_sendblue = AsyncMock(
+            return_value="https://cdn.sb/pic.png"
+        )
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        result = await adapter.send_image_file("+17706768883", str(f), caption="cap")
+        assert result.success
+        sent_payload = adapter._sendblue_api_post.call_args[0][1]
+        assert sent_payload["media_url"] == "https://cdn.sb/pic.png"
+        assert sent_payload["content"] == "cap"
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_upload_failure_propagates(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"data")
+        adapter._upload_file_to_sendblue = AsyncMock(return_value=None)
+        adapter._sendblue_api_post = AsyncMock()
+        result = await adapter.send_image_file("+17706768883", str(f))
+        assert not result.success
+        assert result.retryable is True
+        adapter._sendblue_api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_voice_caf_no_warning(self, monkeypatch, tmp_path, caplog):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "memo.caf"
+        f.write_bytes(b"data")
+        adapter._upload_file_to_sendblue = AsyncMock(
+            return_value="https://cdn.sb/memo.caf"
+        )
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        with caplog.at_level("DEBUG"):
+            result = await adapter.send_voice("+17706768883", str(f))
+        assert result.success
+        assert not any("not .caf" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_send_voice_non_caf_logs_debug(self, monkeypatch, tmp_path, caplog):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "memo.mp3"
+        f.write_bytes(b"data")
+        adapter._upload_file_to_sendblue = AsyncMock(
+            return_value="https://cdn.sb/memo.mp3"
+        )
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        with caplog.at_level("DEBUG"):
+            await adapter.send_voice("+17706768883", str(f))
+        assert any("not .caf" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_send_video_uploads_then_sends(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "clip.mp4"
+        f.write_bytes(b"data")
+        adapter._upload_file_to_sendblue = AsyncMock(
+            return_value="https://cdn.sb/clip.mp4"
+        )
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        result = await adapter.send_video("+17706768883", str(f))
+        assert result.success
+        assert adapter._sendblue_api_post.call_args[0][1]["media_url"].endswith(".mp4")
+
+    @pytest.mark.asyncio
+    async def test_send_document_uploads_then_sends(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "report.pdf"
+        f.write_bytes(b"data")
+        adapter._upload_file_to_sendblue = AsyncMock(
+            return_value="https://cdn.sb/report.pdf"
+        )
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        result = await adapter.send_document(
+            "+17706768883", str(f), caption="see attached"
+        )
+        assert result.success
+        payload = adapter._sendblue_api_post.call_args[0][1]
+        assert payload["content"] == "see attached"
+        assert payload["media_url"].endswith(".pdf")
+
+    @pytest.mark.asyncio
+    async def test_send_animation_delegates_to_send_image(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        result = await adapter.send_animation(
+            "+17706768883", "https://example.com/dance.gif", caption="lol"
+        )
+        assert result.success
+        payload = adapter._sendblue_api_post.call_args[0][1]
+        assert payload["media_url"] == "https://example.com/dance.gif"
+        assert payload["content"] == "lol"
+
+    @pytest.mark.asyncio
+    async def test_media_send_inherits_default_send_style(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, sendblue_default_send_style="confetti")
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"data")
+        adapter._upload_file_to_sendblue = AsyncMock(
+            return_value="https://cdn.sb/pic.png"
+        )
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        await adapter.send_image_file("+17706768883", str(f))
+        sent_payload = adapter._sendblue_api_post.call_args[0][1]
+        assert sent_payload["send_style"] == "confetti"
