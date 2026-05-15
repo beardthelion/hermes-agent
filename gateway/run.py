@@ -6596,6 +6596,11 @@ class GatewayRunner:
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        # Substitute {args} before execution so meal/snack/water
+                        # quick commands receive the actual user input, not the
+                        # literal template placeholder.
+                        user_args = event.get_command_args().strip()
+                        exec_cmd = exec_cmd.replace("{args}", user_args)
                         try:
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
