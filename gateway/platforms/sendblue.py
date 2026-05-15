@@ -369,7 +369,7 @@ class SendblueAdapter(BasePlatformAdapter):
 
         try:
             status, data = await self._sendblue_api_get(
-                "messages",
+                "v2/messages",
                 {"is_outbound": "true", "created_at_gte": day_key, "limit": 1},
                 timeout=3.0,
             )
@@ -378,7 +378,7 @@ class SendblueAdapter(BasePlatformAdapter):
             outbound = data.get("pagination", {}).get("total", 0)
 
             status, data = await self._sendblue_api_get(
-                "messages",
+                "v2/messages",
                 {"is_outbound": "false", "created_at_gte": day_key, "limit": 1},
                 timeout=3.0,
             )
