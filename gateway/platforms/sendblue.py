@@ -115,6 +115,7 @@ class SendblueAdapter(BasePlatformAdapter):
 
     _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"})
     _AUDIO_EXTENSIONS = frozenset({".caf", ".m4a", ".mp3", ".wav", ".aac", ".ogg", ".flac"})
+    _VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".m4v", ".3gp", ".avi", ".mkv", ".webm"})
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SENDBLUE)
@@ -507,13 +508,18 @@ class SendblueAdapter(BasePlatformAdapter):
         """Download a Sendblue CDN media URL and cache it locally.
 
         Returns (local_path, mime_type) on success, (None, None) on failure.
-        MIME type is inferred from the URL extension (Sendblue doesn't provide
-        Content-Type in the webhook payload — extension is the only signal).
+        MIME type is inferred from the URL extension (Sendblue doesn't
+        provide Content-Type in the webhook payload — extension is the
+        only signal).
 
-        For MVP, only image extensions are cached (matching architecture
-        Section 1 "Images only for MVP"). Audio and document extensions
-        log a WARNING and return (None, None) so the caller can fall
-        back to text-only processing.
+        Routes by extension category:
+          - image (jpg/png/gif/webp/heic/heif) → cache_image_from_bytes
+          - audio (caf/m4a/mp3/wav/aac/ogg/flac) → cache_audio_from_bytes
+          - video (mp4/mov/etc.) → cache_document_from_bytes
+            (gateway treats videos as documents downstream)
+          - everything else → cache_document_from_bytes
+
+        Mirrors bluebubbles._download_attachment routing.
         """
         if not self.client:
             return None, None
@@ -521,25 +527,9 @@ class SendblueAdapter(BasePlatformAdapter):
             return None, None
 
         # Extract extension from URL (strip query string, last path segment).
-        # Matches bridge.py:_detect_media_type pattern.
         path = media_url.split("?")[0]
         stem = path.rsplit("/", 1)[-1] if "/" in path else path
         ext = "." + stem.rsplit(".", 1)[-1].lower() if "." in stem else ""
-
-        # MVP: images only. Audio (e.g. .caf voice memos) deferred.
-        if ext not in self._IMAGE_EXTENSIONS:
-            if ext in self._AUDIO_EXTENSIONS:
-                logger.warning(
-                    "[sendblue] audio attachment received (%s) but audio "
-                    "support is deferred — skipped",
-                    ext,
-                )
-            else:
-                logger.warning(
-                    "[sendblue] unsupported media extension %r — skipped",
-                    ext,
-                )
-            return None, None
 
         try:
             resp = await self.client.get(
@@ -550,21 +540,26 @@ class SendblueAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning(
                 "[sendblue] media download failed for %s: %s",
-                _redact(media_url),
-                exc,
+                _redact(media_url), exc,
             )
             return None, None
 
-        # Cache the image bytes. cache_image_from_bytes raises ValueError
-        # if the bytes don't look like a valid image (e.g. HTML error page
-        # returned by the CDN). Catch and degrade gracefully.
         try:
-            local_path = cache_image_from_bytes(data, ext)
+            if ext in self._IMAGE_EXTENSIONS:
+                local_path = cache_image_from_bytes(data, ext)
+            elif ext in self._AUDIO_EXTENSIONS:
+                local_path = cache_audio_from_bytes(data, ext)
+            else:
+                # Videos, documents, and unknown extensions all go to
+                # cache_document_from_bytes — matches BB at bluebubbles.py:731.
+                # Use the URL's last path segment as the filename so the
+                # cached doc keeps a recognizable name.
+                filename = stem or f"file_{uuid.uuid4().hex[:8]}"
+                local_path = cache_document_from_bytes(data, filename)
         except ValueError as exc:
             logger.warning(
-                "[sendblue] media at %s is not a valid image: %s",
-                _redact(media_url),
-                exc,
+                "[sendblue] media at %s failed validation: %s",
+                _redact(media_url), exc,
             )
             return None, None
 
@@ -575,11 +570,14 @@ class SendblueAdapter(BasePlatformAdapter):
     def _ext_to_mime(ext: str) -> str:
         """Map a file extension to a canonical MIME type.
 
-        Used for image extensions in MVP. Audio/video/document support
-        added when those download branches land in future phases.
+        Covers image / audio / video extensions used by Sendblue
+        webhooks. Unknown extensions return application/octet-stream
+        so MessageType still routes to DOCUMENT via
+        _message_type_from_mime.
         """
         ext = ext.lower()
-        if ext == ".jpg" or ext == ".jpeg":
+        # Image
+        if ext in (".jpg", ".jpeg"):
             return "image/jpeg"
         if ext == ".png":
             return "image/png"
@@ -591,6 +589,36 @@ class SendblueAdapter(BasePlatformAdapter):
             return "image/heic"
         if ext == ".heif":
             return "image/heif"
+        # Audio
+        if ext == ".caf":
+            return "audio/x-caf"
+        if ext == ".m4a":
+            return "audio/mp4"
+        if ext == ".mp3":
+            return "audio/mpeg"
+        if ext == ".wav":
+            return "audio/wav"
+        if ext == ".aac":
+            return "audio/aac"
+        if ext == ".ogg":
+            return "audio/ogg"
+        if ext == ".flac":
+            return "audio/flac"
+        # Video
+        if ext == ".mp4":
+            return "video/mp4"
+        if ext == ".mov":
+            return "video/quicktime"
+        if ext == ".m4v":
+            return "video/x-m4v"
+        if ext == ".3gp":
+            return "video/3gpp"
+        if ext == ".avi":
+            return "video/x-msvideo"
+        if ext == ".mkv":
+            return "video/x-matroska"
+        if ext == ".webm":
+            return "video/webm"
         return "application/octet-stream"
 
     async def _handle_webhook(self, request):

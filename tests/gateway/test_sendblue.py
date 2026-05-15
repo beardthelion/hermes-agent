@@ -315,20 +315,118 @@ class TestSendblueMediaDownload:
         cache_mock.assert_called_once_with(b"fake-image-bytes", ".jpg")
 
     @pytest.mark.asyncio
-    async def test_audio_url_warns_and_returns_none(self, monkeypatch, caplog):
+    async def test_audio_url_cached_via_audio_helper(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
-        adapter.client = AsyncMock()  # client exists, but get won't be called
-        with caplog.at_level("WARNING"):
-            local_path, mime_type = await adapter._download_and_cache_media(
-                "https://cdn.sendblue.com/audio/voice.caf"
-            )
-        assert local_path is None
-        assert mime_type is None
-        adapter.client.get.assert_not_called()  # extension check short-circuits
-        assert any(
-            "audio attachment received" in r.getMessage()
-            for r in caplog.records
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(
+            return_value=_MockHttpxResponse(content=b"fake-audio-bytes")
         )
+        cache_audio = Mock(return_value="/cache/voice.caf")
+        cache_image = Mock(side_effect=AssertionError("image helper called for audio"))
+        cache_doc = Mock(side_effect=AssertionError("doc helper called for audio"))
+        monkeypatch.setattr(
+            "gateway.platforms.sendblue.cache_audio_from_bytes", cache_audio,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.sendblue.cache_image_from_bytes", cache_image,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.sendblue.cache_document_from_bytes", cache_doc,
+        )
+        local_path, mime_type = await adapter._download_and_cache_media(
+            "https://cdn.sendblue.com/audio/voice.caf"
+        )
+        assert local_path == "/cache/voice.caf"
+        assert mime_type == "audio/x-caf"
+        cache_audio.assert_called_once_with(b"fake-audio-bytes", ".caf")
+
+    @pytest.mark.asyncio
+    async def test_video_url_cached_via_document_helper(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(
+            return_value=_MockHttpxResponse(content=b"fake-video-bytes")
+        )
+        cache_doc = Mock(return_value="/cache/clip.mp4")
+        monkeypatch.setattr(
+            "gateway.platforms.sendblue.cache_document_from_bytes", cache_doc,
+        )
+        local_path, mime_type = await adapter._download_and_cache_media(
+            "https://cdn.sendblue.com/video/clip.mp4"
+        )
+        assert local_path == "/cache/clip.mp4"
+        assert mime_type == "video/mp4"
+        cache_doc.assert_called_once()
+        # First positional arg is the bytes, second is the filename
+        assert cache_doc.call_args[0][0] == b"fake-video-bytes"
+        assert cache_doc.call_args[0][1] == "clip.mp4"
+
+    @pytest.mark.asyncio
+    async def test_document_url_cached_via_document_helper(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(
+            return_value=_MockHttpxResponse(content=b"%PDF-fake")
+        )
+        cache_doc = Mock(return_value="/cache/report.pdf")
+        monkeypatch.setattr(
+            "gateway.platforms.sendblue.cache_document_from_bytes", cache_doc,
+        )
+        local_path, mime_type = await adapter._download_and_cache_media(
+            "https://cdn.sendblue.com/doc/report.pdf"
+        )
+        assert local_path == "/cache/report.pdf"
+        assert mime_type == "application/octet-stream"
+        assert cache_doc.call_args[0][1] == "report.pdf"
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_falls_to_document(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(
+            return_value=_MockHttpxResponse(content=b"mystery")
+        )
+        cache_doc = Mock(return_value="/cache/file.xyz")
+        monkeypatch.setattr(
+            "gateway.platforms.sendblue.cache_document_from_bytes", cache_doc,
+        )
+        local_path, mime_type = await adapter._download_and_cache_media(
+            "https://cdn.sendblue.com/raw/file.xyz"
+        )
+        assert local_path == "/cache/file.xyz"
+        assert mime_type == "application/octet-stream"
+
+    @pytest.mark.asyncio
+    async def test_webhook_routes_audio_to_voice_message_type(self, monkeypatch):
+        """End-to-end: .caf webhook → handle_message gets MessageType.VOICE
+        with media_urls/media_types populated."""
+        from gateway.platforms.base import MessageType
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get = AsyncMock(
+            return_value=_MockHttpxResponse(content=b"audio-bytes")
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.sendblue.cache_audio_from_bytes",
+            lambda data, ext: "/cache/voice.caf",
+        )
+        adapter.handle_message = AsyncMock()
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17766768883",
+                "media_url": "https://cdn.sendblue.com/audio/voice.caf",
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        assert response.status == 200
+        await _drain_background_tasks(adapter)
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert event.media_urls == ["/cache/voice.caf"]
+        assert event.media_types == ["audio/x-caf"]
 
     @pytest.mark.asyncio
     async def test_download_failure_returns_none(self, monkeypatch, caplog):
