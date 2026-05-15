@@ -233,7 +233,14 @@ Adapter now has BB-parity for media + groups + send_style. Open items that could
 
 - Group chat live validation — adapter is wired for inbound + outbound but never exercised in a real group. Either bootstrap a group via `/api/create-group` or wait until one arrives organically before claiming "tested."
 - Voice-memo end-to-end — `.caf` inbound caches correctly; transcription itself was a bridge-local Groq Whisper hook. Upstream Groq STT plugin is the right home for that, not the adapter.
-- Arch doc resync — sendblue-adapter-architecture.md last synced through ac5c1d509; Session 6 added send_style / media upload / group chat. Re-sync before PR.
+- Arch doc resync — sendblue-adapter-architecture.md re-synced through `385a4786e` end of Session 6 (619 lines, current). Re-check before PR.
+- **Smart send_style selection (deferred)** — plumbing is in place (`metadata["send_style"]` per-call override) but nothing teaches the model *when* to style. Three options sketched end of Session 6: (1) `apply_send_style(style)` tool call; (2) prompt-driven sentinel like `[STYLE:confetti]` at message start that the adapter strips into metadata; (3) heuristic emoji-sniff in the adapter. Default unstyled is the right shipping state — users opt in via env var or future smart-selection.
+- **Onboarding flow for non-Mac users (deferred — needs design)** — when this adapter ships upstream, non-Mac users picking it need an onboarding path. Open questions for that design pass:
+  - Webhook public URL: do users register their own domain (DuckDNS, Cloudflare tunnel, ngrok, etc.) or does the gateway provide a built-in tunnel? Beardy's current setup uses DuckDNS + Caddy; a hosted option would lower the bar significantly.
+  - Caddy / reverse-proxy config: ship a sample Caddyfile snippet, or auto-emit one during setup?
+  - First-run UX: gateway currently has Telegram-style onboarding boilerplate; needs a Sendblue-specific flow walking the user through API key creation, sendblue_number purchase, webhook secret choice, and webhook URL registration.
+  - Credentials storage: dotenv only, or surface them in a `gateway config init` style command?
+  - Reusable beyond Sendblue: Telegram already has onboarding; whatever pattern lands for Sendblue should generalize so future cloud-relay platforms (e.g. a future RCS provider) inherit it.
 
 ### Other pending work
 
