@@ -14,7 +14,7 @@ VPS: 129.213.39.57, SSH as ubuntu. Subdomain beard-hermes.duckdns.org.
 
 Hermes: Fork of NousResearch/hermes-agent at github.com/beardthelion/hermes-agent. Deployed at ~/.hermes/hermes-agent. User-systemd-managed via hermes-gateway.service. Deployment branch is production with an ExecStartPre branch gate that refuses to start if the tree is not on production.
 
-Bridge (transitional, being replaced by the gateway adapter): /opt/sendblue-bridge/bridge.py, ~1500+ LOC. NOT a git repo — every edit is production, no rollback. Systemd-managed via sendblue-bridge.service. Bridges Sendblue iMessage webhooks to the Hermes API server. Allowed number: +17706768883. Sendblue from: +16232843671.
+Bridge (retired 2026-05-14): /opt/sendblue-bridge/bridge.py, ~1500+ LOC. Stopped + disabled via systemctl; webhook unregistered from Sendblue. Files retained on disk for historical reference only. iMessage delivery is now sole-routed through the gateway-native Sendblue adapter. Allowed number: +17706768883. Sendblue from: +16232843671.
 
 ## Architecture Overview
 
@@ -24,7 +24,7 @@ gateway/platforms/sendblue.py upstream PR to NousResearch/hermes-agent so non-Ma
 
 ### Current strategy: dogfood gateway-native locally first
 
-Build gateway/platforms/sendblue.py on the production branch, dogfood in parallel with the bridge using Pattern B (both webhook URLs registered with Sendblue, each adapter filters on the sendblue_number field), then file upstream PR after weeks of production validation.
+Cutover complete 2026-05-14. Adapter is sole iMessage receiver; bridge is retired. Pattern B parallel dogfooding ran for sessions 4-5 before cutover. Next step: file upstream PR to NousResearch/hermes-agent after extended sole-receiver validation.
 
 ### What transfers from bridge to adapter (Sendblue API specifics)
 
@@ -67,7 +67,11 @@ Branch-off decision tree:
 
 ## What's Built So Far
 
-### Bridge-local features (production, work without Hermes changes)
+### Retired bridge features (historical reference — bridge offline as of 2026-05-14)
+
+The following ran inside bridge.py until cutover. Some have gateway-native replacements; some are gaps awaiting upstream work. **`/quota` was ported into `gateway/platforms/sendblue.py` as a platform-native slash command 2026-05-14 (commits 4cee5b1ec + dd1f858a7).** `/memory` is NOT currently available — pending native upstream PR.
+
+Phase 2 macro estimation and Phase 3 running-totals were ported to standalone scripts before cutover: see `~/.hermes/scripts/phase2-macro.py`, `phase3-totals.py`, and `fit-log-watcher.py` (the trigger). The fit-log-watcher.service runs these on inotify-style polling of `~/kb/health/fit-log.md`, fully independent of the bridge.
 
 - /memory (reads ~/.hermes/memories/MEMORY.md and USER.md, formatted SMS response with capacity warnings)
 - /quota (Sendblue API usage bar)
@@ -98,7 +102,7 @@ Branch-off decision tree:
 
 ### Sendblue gateway adapter — current state
 
-Merged to production: feat/sendblue-adapter merged via commit 56bf43864 (2026-05-13). 28 commits from feature branch. Currently DISABLED in config.yaml (enabled: false) — bridge is primary. Re-enable by setting enabled: true + restarting gateway.
+Merged to production: feat/sendblue-adapter merged via commit 56bf43864 (2026-05-13). 28 commits from feature branch. **Live as sole iMessage receiver since 2026-05-14 cutover.** config.yaml `platforms.sendblue.enabled: true`. Webhook URL `https://beard-hermes.duckdns.org/sendblue-gateway/receive` is the only one registered with Sendblue.
 
 Files:
 
@@ -138,6 +142,8 @@ Phase A operational deployment (session 4, 2026-05-13, complete): live round-tri
 - Hermes secret redaction (RedactingFormatter) masks phone numbers in logs, making mismatches invisible. Diagnosed by writing raw bytes to /tmp file to bypass log redactor.
 - systemd unit env vars get silently reverted by gateway's self-update hook (ExecStart --replace rewrites the unit file). Use ~/.hermes/.env for persistent env vars, not the unit file.
 - Adapter disabled after successful test: webhook unregistered from Sendblue, config.yaml enabled: false. Bridge remains primary.
+
+Phase A cutover (session 5, 2026-05-14): adapter re-enabled, bridge webhook unregistered, sendblue-bridge.service stopped + disabled. Three round-trips verified across the cutover boundary: ping/ping2 = 2 SMS each (Pattern B), ping3 = 1 SMS (adapter only). Gateway logs are silent at INFO level by default — adapter return-200 in ~1ms via Caddy access log is the ground-truth signal, not journalctl. Required env-var fix: `_apply_env_overrides` at gateway/config.py:1716-1734 unconditionally overwrites `sendblue_number` and `webhook_public_url` with `os.getenv(..., "")` when API key/secret env vars are present — so `~/.hermes/.env` needs `SENDBLUE_NUMBER=+16232843671` and `SENDBLUE_WEBHOOK_PUBLIC_URL=https://beard-hermes.duckdns.org/sendblue-gateway/receive` even though those values also live in config.yaml `extra:`.
 
 ### BlueBubbles adapter recon notes (reference for Sendblue work)
 
@@ -186,35 +192,16 @@ git diff origin/main is the wrong tool when the branch is far behind upstream. U
 
 ### Operational rules (don't undo)
 
-- bridge.py is not versioned. Every edit is production. No rollback.
 - All systemctl ops on hermes-gateway from SSH, not Telegram. Restarting from inside Telegram kills Beardy's own process.
 - Branch gate recovery: cd to repo → git checkout production → systemctl --user reset-failed hermes-gateway.service → systemctl --user start hermes-gateway.service.
-- Connection leak fix at bridge.py line 1189 (try/finally around `_resolve_session_id`). Don't undo.
-- WAL mode + busy_timeout=5000 in get_db(). Don't undo.
-- Bridge silence watchdog: KEEPALIVE_MIN_INTERVAL_SECONDS is sole gate for keepalive timing. PokeThrottle is intentionally bypassed in keepalive branch. Don't undo.
 - After every session: git checkout production before walking away. Branch gate is `ExecStartPre`-only — does not re-check mid-run, but next restart on a non-production branch refuses.
+- Sendblue adapter env-var precedence trap: `~/.hermes/.env` must include `SENDBLUE_NUMBER` and `SENDBLUE_WEBHOOK_PUBLIC_URL` even though config.yaml has them — `_apply_env_overrides` in gateway/config.py blanks them otherwise.
 
 ## What Remains To Be Done
 
-### Phase A: operational deployment of Sendblue adapter (COMPLETE, adapter currently disabled)
+### Bridge sunset (COMPLETE 2026-05-14)
 
-Completed 2026-05-13. Live round-trip verified with Pattern B parallel testing. Adapter disabled pending extended dogfooding decision.
-
-To re-enable the adapter:
-1. In ~/.hermes/config.yaml: set platforms.sendblue.enabled to true
-2. systemctl --user restart hermes-gateway (from SSH, not Telegram)
-3. Adapter's connect() will auto-register webhook URL with Sendblue
-4. Both bridge and adapter will receive traffic (Pattern B dual response)
-
-To cut over (bridge off, adapter only):
-1. Re-enable adapter (steps above)
-2. Unregister bridge webhook: curl -X DELETE with bridge URL from Sendblue /account/webhooks
-3. systemctl stop sendblue-bridge.service
-
-Infrastructure already in place:
-- Caddy route: /sendblue-gateway/* → 127.0.0.1:8665 (already in Caddyfile)
-- Auth: SENDBLUE_ALLOWED_USERS=+17706768883 (already in ~/.hermes/.env)
-- Config: platforms.sendblue block with all credentials (already in config.yaml, just needs enabled: true)
+All 11 tasks done. Adapter is sole iMessage receiver. Phase 2/3 macro logic ported to `~/.hermes/scripts/`. Bridge service stopped + disabled. fit-log-watcher.service runs the new Phase 2 trigger via mtime polling of `~/kb/health/fit-log.md`.
 
 ### Phase D: Tier-2 test backfill (deferred per arch doc Section 8)
 
