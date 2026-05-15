@@ -106,8 +106,8 @@ Merged to production: feat/sendblue-adapter merged via commit 56bf43864 (2026-05
 
 Files:
 
-- gateway/platforms/sendblue.py — ~883 lines
-- tests/gateway/test_sendblue.py — ~494 lines
+- gateway/platforms/sendblue.py — ~1354 lines
+- tests/gateway/test_sendblue.py — ~1278 lines
 
 MVP code (sessions 1-2, feature complete): all four abstract method bodies real:
 
@@ -144,6 +144,21 @@ Phase A operational deployment (session 4, 2026-05-13, complete): live round-tri
 - Adapter disabled after successful test: webhook unregistered from Sendblue, config.yaml enabled: false. Bridge remains primary.
 
 Phase A cutover (session 5, 2026-05-14): adapter re-enabled, bridge webhook unregistered, sendblue-bridge.service stopped + disabled. Three round-trips verified across the cutover boundary: ping/ping2 = 2 SMS each (Pattern B), ping3 = 1 SMS (adapter only). Gateway logs are silent at INFO level by default — adapter return-200 in ~1ms via Caddy access log is the ground-truth signal, not journalctl. Required env-var fix: `_apply_env_overrides` at gateway/config.py:1716-1734 unconditionally overwrites `sendblue_number` and `webhook_public_url` with `os.getenv(..., "")` when API key/secret env vars are present — so `~/.hermes/.env` needs `SENDBLUE_NUMBER=+16232843671` and `SENDBLUE_WEBHOOK_PUBLIC_URL=https://beard-hermes.duckdns.org/sendblue-gateway/receive` even though those values also live in config.yaml `extra:`.
+
+Session 6 audit + feature pass (2026-05-15): adapter audited against bluebubbles.py; six commits on production closing BB-parity gaps and the two audit bugs. 82 tests passing.
+
+- `758c69823` — `send_style` port (13-style frozenset, env var `SENDBLUE_DEFAULT_SEND_STYLE`, per-call override via `metadata["send_style"]`, invalid styles dropped at WARNING). Confetti confirmed live.
+- `e52a41728` — outbound media via `/api/upload-file` (multipart upload, returns `media_url`). Adds `send_image_file`, `send_voice`, `send_video`, `send_document`, `send_animation`. `.caf` files render as native iMessage voice memos per Sendblue's extension-based routing. Unblocks `auto_tts` → `play_tts` → `send_voice`.
+- `bc3f4af24` — `_verify_signature` now uses `hmac.compare_digest`; `send()` returns `success=False` when `multi_bubble_split` produces zero chunks.
+- `d971beff8` — inbound audio/video/document caching via `cache_audio_from_bytes` / `cache_document_from_bytes` (was warns-and-drops). `_ext_to_mime` expanded with audio + video MIME types.
+- `076c5d9da` — group chat support. Inbound: non-empty `group_id` flips `chat_type="group"`, chat_id becomes group_id, `group_display_name` populates `chat_name`. Outbound: `_is_group_chat_id` (UUID-ish vs `+E.164`) routes to `/api/send-group-message` with `group_id` field. `mark_read` and `send_typing` skip cleanly for groups (no documented per-group APIs).
+- `cd1cfab3d` — `_get_sendblue_day_key` returns UTC `...Z` ISO (was local with offset); fire-and-forget `mark_read` task now registered in `self._background_tasks` with discard callback.
+
+Endpoint cheat sheet (from Sendblue docs, locked in this session):
+
+- `POST /api/upload-file` — multipart, field `file`, returns `{media_url, mediaObjectId}`. 100 MB cap.
+- `POST /api/send-group-message` — required: `content`, `from_number`. Optional: `group_id`, `numbers[]`, `media_url`, `seat_id`. Reply to existing group = pass its `group_id`.
+- Inbound webhook fields used: `is_outbound`, `sendblue_number`, `from_number`, `content`, `media_url`, `message_handle`, `group_id`, `group_display_name`, `participants`.
 
 ### BlueBubbles adapter recon notes (reference for Sendblue work)
 
@@ -211,6 +226,14 @@ Write after weeks of production validation, before upstream PR submission:
 - TestSendblueHelpers
 - TestSendblueMessageEvent
 - TestSendblueMessageEventConstruction
+
+### Upstream PR readiness (post-Session 6)
+
+Adapter now has BB-parity for media + groups + send_style. Open items that could land before or with the upstream PR:
+
+- Group chat live validation — adapter is wired for inbound + outbound but never exercised in a real group. Either bootstrap a group via `/api/create-group` or wait until one arrives organically before claiming "tested."
+- Voice-memo end-to-end — `.caf` inbound caches correctly; transcription itself was a bridge-local Groq Whisper hook. Upstream Groq STT plugin is the right home for that, not the adapter.
+- Arch doc resync — sendblue-adapter-architecture.md last synced through ac5c1d509; Session 6 added send_style / media upload / group chat. Re-sync before PR.
 
 ### Other pending work
 
