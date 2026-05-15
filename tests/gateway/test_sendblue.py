@@ -1,5 +1,6 @@
 """Tests for the Sendblue iMessage gateway adapter."""
 import asyncio
+import hmac
 import json
 from unittest.mock import AsyncMock, Mock
 
@@ -103,6 +104,42 @@ class TestSendblueSignatureVerification:
         adapter = _make_adapter(monkeypatch)
         adapter.webhook_secret = ""
         assert adapter._verify_signature("whatever") is True
+
+    def test_uses_constant_time_compare(self, monkeypatch):
+        """Regression guard: _verify_signature must use hmac.compare_digest,
+        not plain '==', to avoid timing-attack leakage on the webhook
+        signing secret."""
+        import gateway.platforms.sendblue as sb
+        adapter = _make_adapter(monkeypatch, webhook_secret="abc123")
+        called = {"hit": False}
+        real = hmac.compare_digest
+
+        def spy(a, b):
+            called["hit"] = True
+            return real(a, b)
+
+        import hmac as _hmac_module
+        monkeypatch.setattr(sb, "hmac", type("M", (), {"compare_digest": spy}))
+        assert adapter._verify_signature("abc123") is True
+        assert called["hit"] is True
+
+
+class TestSendblueSendEmptyChunks:
+    @pytest.mark.asyncio
+    async def test_multibubble_blank_paragraphs_returns_failure(self, monkeypatch):
+        """multi_bubble_split + content that's only blank lines yields
+        zero chunks. Must return success=False, not silent success."""
+        adapter = _make_adapter(monkeypatch, multi_bubble_split=True)
+        adapter._sendblue_api_post = AsyncMock()
+        # format_message(strip_markdown) collapses whitespace differently per
+        # input; use a value that survives format_message but splits empty.
+        # Stub format_message to return a known empty-paragraph string so the
+        # test is independent of strip_markdown's behavior.
+        adapter.format_message = lambda c: "\n\n   \n\n"
+        result = await adapter.send("+17706768883", "anything")
+        assert result.success is False
+        assert "empty" in (result.error or "").lower()
+        adapter._sendblue_api_post.assert_not_called()
 
 
 class TestSendblueWebhookRouting:

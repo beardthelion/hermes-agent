@@ -12,6 +12,7 @@ Architecture pattern modeled on bluebubbles.py.
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -263,7 +264,7 @@ class SendblueAdapter(BasePlatformAdapter):
         """
         if not self.webhook_secret:
             return True
-        return header_value == self.webhook_secret
+        return hmac.compare_digest(header_value, self.webhook_secret)
 
     async def _find_registered_webhook_urls(self) -> List[str]:
         """Fetch the list of currently-registered receive webhook URLs.
@@ -902,6 +903,12 @@ class SendblueAdapter(BasePlatformAdapter):
                         para, max_length=self.MAX_MESSAGE_LENGTH
                     )
                 )
+
+        if not chunks:
+            return SendResult(
+                success=False,
+                error="Sendblue send requires non-empty text (all chunks empty after split)",
+            )
 
         last = SendResult(success=True)
         for chunk in chunks:
