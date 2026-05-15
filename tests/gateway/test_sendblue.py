@@ -2,6 +2,7 @@
 import asyncio
 import hmac
 import json
+from datetime import datetime
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -1203,3 +1204,75 @@ class TestSendblueGroupChat:
         adapter._sendblue_api_post = AsyncMock()
         await adapter.send_typing("550e8400-e29b-41d4-a716-446655440000")
         adapter._sendblue_api_post.assert_not_called()
+
+
+class TestSendblueQuotaDayKey:
+    def test_day_key_is_utc_zulu_format(self, monkeypatch):
+        """_get_sendblue_day_key must return a Z-suffixed UTC string,
+        not an offset-bearing local ISO. Sendblue's created_at_gte
+        parsing is not guaranteed to handle offsets — UTC is unambiguous."""
+        from gateway.platforms.sendblue import SendblueAdapter
+        key = SendblueAdapter._get_sendblue_day_key()
+        assert key.endswith("Z"), key
+        # No offset like +HH:MM or -HH:MM should appear
+        assert "+" not in key
+        assert key.count("-") == 2  # only the two date separators
+        # Parses cleanly as UTC ISO-8601
+        parsed = datetime.fromisoformat(key.replace("Z", "+00:00"))
+        assert parsed.tzinfo is not None
+
+    def test_day_key_is_3am_eastern_boundary(self, monkeypatch):
+        """The cutoff hour is always 3am America/New_York. After UTC
+        conversion that's 07:00Z (EST) or 08:00Z (EDT) — minutes/
+        seconds must be zero either way."""
+        from gateway.platforms.sendblue import SendblueAdapter
+        key = SendblueAdapter._get_sendblue_day_key()
+        # Hour is 07 (EST = winter) or 08 (EDT = summer); minutes+seconds zero
+        assert key[11:13] in ("07", "08"), key
+        assert key[14:16] == "00", key
+        assert key[17:19] == "00", key
+
+
+class TestSendblueMarkReadTaskTracking:
+    @pytest.mark.asyncio
+    async def test_webhook_mark_read_task_is_tracked(self, monkeypatch):
+        """The fire-and-forget mark_read in STEP 3i must register with
+        self._background_tasks so adapter shutdown can drain it
+        cleanly. Regression guard against the prior bare
+        asyncio.create_task that left tasks GC-cancellable."""
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        # Slow mark_read so the task is still pending when we inspect
+        # the set (otherwise the discard callback would have fired).
+        mark_read_started = asyncio.Event()
+        mark_read_release = asyncio.Event()
+
+        async def slow_mark_read(_chat_id):
+            mark_read_started.set()
+            await mark_read_release.wait()
+            return True
+
+        adapter.mark_read = slow_mark_read
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17706768883",
+                "content": "hi",
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        await adapter._handle_webhook(request)
+        await mark_read_started.wait()
+        # mark_read task is pending; handle_message task may also be in the
+        # set. We just assert at least one of the tracked tasks is the
+        # mark_read coroutine.
+        tracked_coros = [
+            t.get_coro().__qualname__ for t in adapter._background_tasks
+        ]
+        assert any("slow_mark_read" in q for q in tracked_coros), tracked_coros
+        mark_read_release.set()
+        await _drain_background_tasks(adapter)
+        # After completion, the discard callback should have removed it
+        assert all(not t.get_coro().__qualname__.endswith("slow_mark_read")
+                   for t in adapter._background_tasks)

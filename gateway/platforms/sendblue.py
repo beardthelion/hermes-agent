@@ -19,7 +19,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -398,8 +398,11 @@ class SendblueAdapter(BasePlatformAdapter):
     def _get_sendblue_day_key() -> str:
         """Sendblue daily quota resets at 3am America/New_York.
 
-        Returns ISO timestamp of the current day's window start. Before
-        3am EST/EDT the window started 3am the previous day.
+        Returns the UTC ISO-8601 timestamp (Z suffix) of the current
+        day's window start. Computed in America/New_York to respect
+        the 3am EST/EDT cutoff (and DST), then converted to UTC so the
+        value passed as `created_at_gte` is unambiguous regardless of
+        how Sendblue parses ISO offsets.
         """
         try:
             from zoneinfo import ZoneInfo
@@ -410,7 +413,8 @@ class SendblueAdapter(BasePlatformAdapter):
         cutoff = now.replace(hour=3, minute=0, second=0, microsecond=0)
         if now < cutoff:
             cutoff -= timedelta(days=1)
-        return cutoff.isoformat()
+        utc_cutoff = cutoff.astimezone(timezone.utc)
+        return utc_cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     async def _fetch_sendblue_usage(self) -> Dict[str, Any]:
         """Count today's outbound + inbound messages via Sendblue API.
@@ -776,9 +780,12 @@ class SendblueAdapter(BasePlatformAdapter):
             # -- STEP 3i: Fire-and-forget read receipt --
             # Sendblue's mark-read API targets a DM by the other party's
             # number. There's no documented per-group mark-read, so skip
-            # for group messages.
+            # for group messages. Track the task so adapter shutdown can
+            # await it cleanly instead of GC-cancelling mid-flight.
             if self.send_read_receipts and not is_group:
-                asyncio.create_task(self.mark_read(from_number))
+                read_task = asyncio.create_task(self.mark_read(from_number))
+                self._background_tasks.add(read_task)
+                read_task.add_done_callback(self._background_tasks.discard)
 
         # -- STEP 4: Return --
         return web.Response(text="ok")
