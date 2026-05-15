@@ -578,3 +578,63 @@ class TestSendblueQuotaCommand:
         sent_content = adapter.send.call_args[0][1]
         assert "📊 Sendblue" in sent_content
         adapter.handle_message.assert_not_called()
+
+
+class TestSendblueReadReceiptsAndTyping:
+    @pytest.mark.asyncio
+    async def test_mark_read_posts_correct_payload(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(return_value=(200, {}))
+        ok = await adapter.mark_read("+17766768883")
+        assert ok is True
+        adapter._sendblue_api_post.assert_called_once_with(
+            "mark-read",
+            {"number": "+17766768883", "from_number": "+15555550100"},
+            timeout=5.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_mark_read_disabled_when_flag_false(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        adapter._sendblue_api_post = AsyncMock()
+        ok = await adapter.mark_read("+17766768883")
+        assert ok is False
+        adapter._sendblue_api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mark_read_failure_returns_false(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(return_value=(400, "bad"))
+        ok = await adapter.mark_read("+17766768883")
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_send_typing_posts_correct_payload(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(return_value=(200, {}))
+        result = await adapter.send_typing("+17766768883")
+        assert result is None
+        adapter._sendblue_api_post.assert_called_once_with(
+            "send-typing-indicator",
+            {"number": "+17766768883", "from_number": "+15555550100"},
+            timeout=5.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_webhook_dispatches_mark_read(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        adapter.mark_read = AsyncMock(return_value=True)
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17766768883",
+                "content": "hello",
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        assert response.status == 200
+        await _drain_background_tasks(adapter)
+        adapter.mark_read.assert_called_once_with("+17766768883")

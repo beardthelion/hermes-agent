@@ -684,9 +684,9 @@ class SendblueAdapter(BasePlatformAdapter):
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
 
-            # -- STEP 3i: Read receipts deferred until mark_read() lands --
-            # if self.send_read_receipts:
-            #     asyncio.create_task(self.mark_read(from_number))
+            # -- STEP 3i: Fire-and-forget read receipt --
+            if self.send_read_receipts:
+                asyncio.create_task(self.mark_read(from_number))
 
         # -- STEP 4: Return --
         return web.Response(text="ok")
@@ -992,6 +992,44 @@ class SendblueAdapter(BasePlatformAdapter):
             message_id=str(msg_id),
             raw_response=parsed,
         )
+
+    async def mark_read(self, chat_id: str) -> bool:
+        """Send a read receipt for a received iMessage.
+
+        POST /api/mark-read. Sendblue accepts 200 or 202 as success.
+        Gated by self.send_read_receipts (extra.send_read_receipts,
+        default True).
+        """
+        if not self.send_read_receipts:
+            return False
+        status, body = await self._sendblue_api_post(
+            "mark-read",
+            {"number": chat_id, "from_number": self.sendblue_number},
+            timeout=5.0,
+        )
+        if status in (200, 202):
+            return True
+        logger.warning(
+            "[sendblue] mark_read failed (%d): %s", status, str(body)[:200]
+        )
+        return False
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Show a typing indicator on the recipient's device.
+
+        POST /api/send-typing-indicator. Called by the gateway's
+        auto-typing keepalive loop while the agent is composing a
+        reply. Sendblue typing indicators are short-lived; the
+        keepalive loop refreshes them automatically. No stop_typing
+        override needed.
+        """
+        status, _ = await self._sendblue_api_post(
+            "send-typing-indicator",
+            {"number": chat_id, "from_number": self.sendblue_number},
+            timeout=5.0,
+        )
+        if status not in (200, 202):
+            logger.debug("[sendblue] send_typing returned %d", status)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "dm"}
