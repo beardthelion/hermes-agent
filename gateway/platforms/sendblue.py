@@ -167,6 +167,14 @@ class SendblueAdapter(BasePlatformAdapter):
     # API helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_group_chat_id(chat_id: str) -> bool:
+        """Sendblue group IDs are UUID-like strings; DM chat IDs are
+        E.164 phone numbers starting with +. The phone-number prefix
+        is the only reliable distinguisher in webhook payloads.
+        """
+        return bool(chat_id) and not chat_id.startswith("+")
+
     def _resolve_send_style(
         self, metadata: Optional[Dict[str, Any]]
     ) -> Optional[str]:
@@ -686,6 +694,13 @@ class SendblueAdapter(BasePlatformAdapter):
             from_number = item.get("from_number", "")
             msg_handle = item.get("message_handle", "")
             media_url = (item.get("media_url") or "").strip() or None
+            group_id = (item.get("group_id") or "").strip()
+            group_display_name = (item.get("group_display_name") or "").strip()
+            is_group = bool(group_id)
+            # In a group, replies route to the group_id, not the sender's
+            # number. In a DM, both are the same effectively (chat_id is
+            # the other party's phone).
+            chat_id = group_id if is_group else from_number
 
             # -- STEP 3e: Media handling --
             media_urls: List[str] = []
@@ -710,18 +725,17 @@ class SendblueAdapter(BasePlatformAdapter):
             # Step 3f and is silently dropped (no text, nothing to dispatch).
 
             # -- STEP 3f: Required fields check --
-            if not from_number or not text:
+            if not from_number or not text or not chat_id:
                 logger.debug(
                     "[sendblue] missing required fields -- "
-                    "from_number=%r, has_text=%s",
-                    from_number,
-                    bool(text),
+                    "from_number=%r, has_text=%s, chat_id=%r",
+                    from_number, bool(text), chat_id,
                 )
                 continue
 
             # -- STEP 3f.5: Platform-native slash command intercept --
             if text.strip().lower() == "/quota":
-                async def _send_quota_reply(target=from_number):
+                async def _send_quota_reply(target=chat_id):
                     try:
                         usage = await self._fetch_sendblue_usage()
                         reply = self._format_quota_response(usage)
@@ -738,9 +752,9 @@ class SendblueAdapter(BasePlatformAdapter):
 
             # -- STEP 3g: Build MessageEvent --
             source = self.build_source(
-                chat_id=from_number,
-                chat_name=from_number,
-                chat_type="dm",
+                chat_id=chat_id,
+                chat_name=group_display_name or chat_id,
+                chat_type="group" if is_group else "dm",
                 user_id=from_number,
                 user_name=from_number,
             )
@@ -760,7 +774,10 @@ class SendblueAdapter(BasePlatformAdapter):
             task.add_done_callback(self._background_tasks.discard)
 
             # -- STEP 3i: Fire-and-forget read receipt --
-            if self.send_read_receipts:
+            # Sendblue's mark-read API targets a DM by the other party's
+            # number. There's no documented per-group mark-read, so skip
+            # for group messages.
+            if self.send_read_receipts and not is_group:
                 asyncio.create_task(self.mark_read(from_number))
 
         # -- STEP 4: Return --
@@ -938,18 +955,22 @@ class SendblueAdapter(BasePlatformAdapter):
                 error="Sendblue send requires non-empty text (all chunks empty after split)",
             )
 
+        is_group = self._is_group_chat_id(chat_id)
+        endpoint = "send-group-message" if is_group else "send-message"
+
         last = SendResult(success=True)
         for chunk in chunks:
             payload: Dict[str, Any] = {
-                "number": chat_id,
                 "from_number": self.sendblue_number,
                 "content": chunk,
             }
+            if is_group:
+                payload["group_id"] = chat_id
+            else:
+                payload["number"] = chat_id
             if send_style:
                 payload["send_style"] = send_style
-            status, body = await self._sendblue_api_post(
-                "send-message", payload
-            )
+            status, body = await self._sendblue_api_post(endpoint, payload)
             if not (200 <= status < 300):
                 retryable = (status == 0 or status >= 500)
                 logger.error(
@@ -1058,17 +1079,22 @@ class SendblueAdapter(BasePlatformAdapter):
         send_style = self._resolve_send_style(metadata)
         caption_text = self.format_message(caption) if caption else ""
 
+        is_group = self._is_group_chat_id(chat_id)
+        endpoint = "send-group-message" if is_group else "send-message"
         payload: Dict[str, Any] = {
-            "number": chat_id,
             "from_number": self.sendblue_number,
             "media_url": media_url,
         }
+        if is_group:
+            payload["group_id"] = chat_id
+        else:
+            payload["number"] = chat_id
         if caption_text:
             payload["content"] = caption_text
         if send_style:
             payload["send_style"] = send_style
 
-        status, body = await self._sendblue_api_post("send-message", payload)
+        status, body = await self._sendblue_api_post(endpoint, payload)
         if not (200 <= status < 300):
             retryable = (status == 0 or status >= 500)
             logger.error(
@@ -1277,6 +1303,10 @@ class SendblueAdapter(BasePlatformAdapter):
         """
         if not self.send_read_receipts:
             return False
+        if self._is_group_chat_id(chat_id):
+            # Sendblue's mark-read API targets a DM by the other party's
+            # number. No documented per-group equivalent; silently skip.
+            return False
         status, body = await self._sendblue_api_post(
             "mark-read",
             {"number": chat_id, "from_number": self.sendblue_number},
@@ -1298,6 +1328,10 @@ class SendblueAdapter(BasePlatformAdapter):
         keepalive loop refreshes them automatically. No stop_typing
         override needed.
         """
+        if self._is_group_chat_id(chat_id):
+            # Sendblue's typing-indicator API targets a DM; no
+            # documented per-group equivalent.
+            return
         status, _ = await self._sendblue_api_post(
             "send-typing-indicator",
             {"number": chat_id, "from_number": self.sendblue_number},
@@ -1307,4 +1341,7 @@ class SendblueAdapter(BasePlatformAdapter):
             logger.debug("[sendblue] send_typing returned %d", status)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        return {"name": chat_id, "type": "dm"}
+        return {
+            "name": chat_id,
+            "type": "group" if self._is_group_chat_id(chat_id) else "dm",
+        }

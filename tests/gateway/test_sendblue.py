@@ -1071,3 +1071,135 @@ class TestSendblueMediaUpload:
         await adapter.send_image_file("+17706768883", str(f))
         sent_payload = adapter._sendblue_api_post.call_args[0][1]
         assert sent_payload["send_style"] == "confetti"
+
+
+class TestSendblueGroupChat:
+    def test_is_group_chat_id_truth_table(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        # E.164 phone numbers = DM
+        assert adapter._is_group_chat_id("+17706768883") is False
+        assert adapter._is_group_chat_id("+1234567890") is False
+        # Non-phone-prefixed strings = group
+        assert adapter._is_group_chat_id("group_abc123") is True
+        assert adapter._is_group_chat_id("550e8400-e29b-41d4-a716-446655440000") is True
+        # Edge cases
+        assert adapter._is_group_chat_id("") is False
+        assert adapter._is_group_chat_id(None) is False
+
+    @pytest.mark.asyncio
+    async def test_get_chat_info_distinguishes_dm_and_group(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        dm_info = await adapter.get_chat_info("+17706768883")
+        assert dm_info["type"] == "dm"
+        group_info = await adapter.get_chat_info("group_abc123")
+        assert group_info["type"] == "group"
+
+    @pytest.mark.asyncio
+    async def test_webhook_group_message_routes_to_group_id(self, monkeypatch):
+        """Group webhook → MessageEvent.source.chat_id is group_id,
+        chat_type is "group", user_id is the sender's phone."""
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        adapter.mark_read = AsyncMock()
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17706768883",
+                "content": "hello group",
+                "group_id": "550e8400-e29b-41d4-a716-446655440000",
+                "group_display_name": "Family Chat",
+                "participants": ["+17706768883", "+15551234567"],
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        assert response.status == 200
+        await _drain_background_tasks(adapter)
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.chat_id == "550e8400-e29b-41d4-a716-446655440000"
+        assert event.source.chat_type == "group"
+        assert event.source.chat_name == "Family Chat"
+        assert event.source.user_id == "+17706768883"
+        # Read receipts not sent for group messages
+        adapter.mark_read.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_webhook_dm_unchanged_by_group_plumbing(self, monkeypatch):
+        """Regression guard: regular DM webhooks still route to from_number
+        with chat_type='dm' after the group support refactor."""
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17706768883",
+                "content": "hi",
+                "group_id": "",  # empty string = DM per docs
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        assert response.status == 200
+        await _drain_background_tasks(adapter)
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.chat_id == "+17706768883"
+        assert event.source.chat_type == "dm"
+
+    @pytest.mark.asyncio
+    async def test_send_to_group_uses_group_endpoint(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        result = await adapter.send("550e8400-e29b-41d4-a716-446655440000", "hello")
+        assert result.success
+        endpoint, payload = adapter._sendblue_api_post.call_args[0][:2]
+        assert endpoint == "send-group-message"
+        assert payload["group_id"] == "550e8400-e29b-41d4-a716-446655440000"
+        assert "number" not in payload
+
+    @pytest.mark.asyncio
+    async def test_send_to_dm_uses_regular_endpoint(self, monkeypatch):
+        """Regression guard for DM path after group routing landed."""
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        await adapter.send("+17706768883", "hi")
+        endpoint, payload = adapter._sendblue_api_post.call_args[0][:2]
+        assert endpoint == "send-message"
+        assert payload["number"] == "+17706768883"
+        assert "group_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_send_image_to_group_uses_group_endpoint(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(
+            return_value=(200, json.dumps({"message_handle": "h1"}))
+        )
+        await adapter.send_image(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "https://example.com/a.png",
+        )
+        endpoint, payload = adapter._sendblue_api_post.call_args[0][:2]
+        assert endpoint == "send-group-message"
+        assert payload["group_id"] == "550e8400-e29b-41d4-a716-446655440000"
+        assert payload["media_url"] == "https://example.com/a.png"
+        assert "number" not in payload
+
+    @pytest.mark.asyncio
+    async def test_mark_read_skips_groups(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock()
+        ok = await adapter.mark_read("550e8400-e29b-41d4-a716-446655440000")
+        assert ok is False
+        adapter._sendblue_api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_typing_skips_groups(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock()
+        await adapter.send_typing("550e8400-e29b-41d4-a716-446655440000")
+        adapter._sendblue_api_post.assert_not_called()
