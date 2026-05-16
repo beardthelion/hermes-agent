@@ -6600,7 +6600,7 @@ class GatewayRunner:
                         # quick commands receive the actual user input, not the
                         # literal template placeholder.
                         user_args = event.get_command_args().strip()
-                        exec_cmd = exec_cmd.replace("{args}", user_args)
+                        exec_cmd = exec_cmd.replace("{args}", shlex.quote(user_args))
                         try:
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
