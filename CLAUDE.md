@@ -99,6 +99,7 @@ Phase 2 macro estimation and Phase 3 running-totals were ported to standalone sc
 - #19041 — /compress (falls through to LLM locally — no api_server handler deployed)
 - #20051 — docs(web_tools) summarizer timeout comment
 - #22828 — feat(api_server) forward tool result fields in hermes.tool.progress completed events. Extensible whitelist pattern (`_TOOL_RESULT_FIELDS`), image_generate → "image" first entry. Follow-up commit a86fcd147 shipped addressing Code Claude audit (key collision guard, size constraints, 2 new tests). 144 tests passing under scripts/run_tests.sh. Prerequisite for outbound media in Sendblue adapter.
+- #27141 — feat(gateway) `{args}` substitution in exec-type quick commands. Single squashed commit off origin/main (branch `feat/quick-command-args-substitution`, fork tip `ed9d2d8b9`). Combines the feature (production commit `01bfc0c78`) and shell-quoting safety (production commit `a31dd9862`) into one diff. Production already carries both commits; if maintainer rebases, re-squash on the PR branch only — production stays as-is.
 
 ### Sendblue gateway adapter — current state
 
