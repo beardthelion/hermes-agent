@@ -300,6 +300,10 @@ Working tree left on a PR branch after pushing to fork is a latent failure. Bran
 
 A working gateway platform needs THREE separate registrations: (1) the adapter class in `gateway/platforms/<name>.py`, (2) a composite toolset in `toolsets.py` (`"hermes-<name>": {"tools": _HERMES_CORE_TOOLS}`), (3) a PLATFORMS entry in `hermes_cli/platforms.py`. The adapter alone runs and sends/receives messages but the agent it serves gets an empty toolset because `_get_platform_tools` resolves `hermes-<name>` to nothing if (2) is missing. Symptom: model says "I can't do X" even when other adapters on the same gateway can. Counter: when adding a platform, copy the BB pattern across ALL THREE files, not just `gateway/platforms/`. Hit 2026-05-17: Sendblue had been running without image_gen / vision / web / browser / terminal / etc. since cutover because only file (1) was wired.
 
+### Toolset config changes don't retroactively reach live sessions
+
+Sessions persist across gateway restarts. When you add tools via `platform_toolsets` in config.yaml and restart the gateway, an *already-running* chat session still carries conversational history from before the change — including turns where the model said "I don't have that tool." Weak tool-callers (DeepSeek, smaller models) will echo that prior position from context instead of re-checking their actual tool list each turn. Symptom: tool is provably in scope (`_get_platform_tools` resolves it, `resolve_toolset` includes it) but the model keeps saying it can't. Counter: send `/reset` on the affected session after any toolset config change. Hit 2026-05-17: Sendblue toolset gap fixed, gateway restarted, image-gen still refused until `/reset` cleared the day-old session context.
+
 ### Latent bugs vs exercised code
 
 Two production-crashing bugs sat in _handle_webhook for the entire MVP build phase because no code path exercised them. Test backfill is the intervention that catches this class — by exercising every branch, latent issues surface in test failures rather than production logs. Concrete data point for valuing B-before-A test backfill.
