@@ -10,9 +10,13 @@ Workflow is a relay: Claude proposes, user reviews, Beardy (the Hermes agent on 
 
 ## Infrastructure
 
-VPS: 129.213.39.57, SSH as ubuntu. Subdomain beard-hermes.duckdns.org.
+VPS: 129.213.39.57, SSH as ubuntu. Subdomain beard-hermes.duckdns.org (legacy; no longer used for Sendblue webhook as of 2026-05-18).
+
+Tailscale (set up 2026-05-18): VPS, phone, and Legion Go all on tailnet. VPS tailnet IP `100.90.14.118`, hostname `hermes`, full FQDN `hermes.tail5699ae.ts.net`. MagicDNS on. SSH bound to tailnet IP + 127.0.0.1 only via `/etc/systemd/system/ssh.socket.d/tailnet-only.conf`; public port 22 is dead at the host (Oracle security list still allows it, so removing the override file restores public SSH). Tailscale Funnel exposes `/sendblue-gateway/receive` on `:443` (public — Sendblue webhook ingress). Tailscale Serve exposes WebUI on `:8443` (tailnet-only).
 
 Hermes: Fork of NousResearch/hermes-agent at github.com/beardthelion/hermes-agent. Deployed at ~/.hermes/hermes-agent. User-systemd-managed via hermes-gateway.service. Deployment branch is production with an ExecStartPre branch gate that refuses to start if the tree is not on production.
+
+Hermes WebUI (set up 2026-05-18): nesquena/hermes-webui at `~/hermes-webui`. User-systemd-managed via `hermes-webui.service` (ordered After=hermes-gateway). Binds 127.0.0.1:8787; exposed at `https://hermes.tail5699ae.ts.net:8443/` (tailnet-only). Password in `~/hermes-webui/.env` (mode 600). Uses the agent's venv (`~/.hermes/hermes-agent/venv`), state at `~/.hermes/webui/`, default workspace `~/workspace`. `ctl.sh` doesn't see the systemd-managed instance — use `systemctl --user` for lifecycle.
 
 Bridge (retired 2026-05-14): /opt/sendblue-bridge/bridge.py, ~1500+ LOC. Stopped + disabled via systemctl; webhook unregistered from Sendblue. Files retained on disk for historical reference only. iMessage delivery is now sole-routed through the gateway-native Sendblue adapter. Allowed number: +17706768883. Sendblue from: +16232843671.
 
@@ -103,7 +107,7 @@ Phase 2 macro estimation and Phase 3 running-totals were ported to standalone sc
 
 ### Sendblue gateway adapter — current state
 
-Merged to production: feat/sendblue-adapter merged via commit 56bf43864 (2026-05-13). 28 commits from feature branch. **Live as sole iMessage receiver since 2026-05-14 cutover.** config.yaml `platforms.sendblue.enabled: true`. Webhook URL `https://beard-hermes.duckdns.org/sendblue-gateway/receive` is the only one registered with Sendblue.
+Merged to production: feat/sendblue-adapter merged via commit 56bf43864 (2026-05-13). 28 commits from feature branch. **Live as sole iMessage receiver since 2026-05-14 cutover.** config.yaml `platforms.sendblue.enabled: true`. Webhook URL `https://hermes.tail5699ae.ts.net/sendblue-gateway/receive` (Tailscale Funnel since 2026-05-18; previously DuckDNS/Caddy) is the only one registered with Sendblue. Caddy still has the `/sendblue-gateway/*` route as dead code — Sendblue no longer hits it.
 
 Files:
 
@@ -144,7 +148,7 @@ Phase A operational deployment (session 4, 2026-05-13, complete): live round-tri
 - systemd unit env vars get silently reverted by gateway's self-update hook (ExecStart --replace rewrites the unit file). Use ~/.hermes/.env for persistent env vars, not the unit file.
 - Adapter disabled after successful test: webhook unregistered from Sendblue, config.yaml enabled: false. Bridge remains primary.
 
-Phase A cutover (session 5, 2026-05-14): adapter re-enabled, bridge webhook unregistered, sendblue-bridge.service stopped + disabled. Three round-trips verified across the cutover boundary: ping/ping2 = 2 SMS each (Pattern B), ping3 = 1 SMS (adapter only). Gateway logs are silent at INFO level by default — adapter return-200 in ~1ms via Caddy access log is the ground-truth signal, not journalctl. Required env-var fix: `_apply_env_overrides` at gateway/config.py:1716-1734 unconditionally overwrites `sendblue_number` and `webhook_public_url` with `os.getenv(..., "")` when API key/secret env vars are present — so `~/.hermes/.env` needs `SENDBLUE_NUMBER=+16232843671` and `SENDBLUE_WEBHOOK_PUBLIC_URL=https://beard-hermes.duckdns.org/sendblue-gateway/receive` even though those values also live in config.yaml `extra:`.
+Phase A cutover (session 5, 2026-05-14): adapter re-enabled, bridge webhook unregistered, sendblue-bridge.service stopped + disabled. Three round-trips verified across the cutover boundary: ping/ping2 = 2 SMS each (Pattern B), ping3 = 1 SMS (adapter only). Gateway logs are silent at INFO level by default — adapter return-200 in ~1ms via Caddy access log is the ground-truth signal, not journalctl. Required env-var fix: `_apply_env_overrides` at gateway/config.py:1716-1734 unconditionally overwrites `sendblue_number` and `webhook_public_url` with `os.getenv(..., "")` when API key/secret env vars are present — so `~/.hermes/.env` needs `SENDBLUE_NUMBER=+16232843671` and `SENDBLUE_WEBHOOK_PUBLIC_URL=https://hermes.tail5699ae.ts.net/sendblue-gateway/receive` (Tailscale Funnel as of 2026-05-18) even though those values also live in config.yaml `extra:`.
 
 Session 6 audit + feature pass (2026-05-15): adapter audited against bluebubbles.py; six commits on production closing BB-parity gaps and the two audit bugs. 82 tests passing.
 
@@ -328,6 +332,14 @@ Hermes RedactingFormatter redacts phone numbers, API keys, and other secrets in 
 ### systemd unit env vars silently reverted by gateway self-update
 
 The gateway's --replace flag rewrites the systemd unit file on startup, stripping any manually-added Environment lines. Use ~/.hermes/.env for persistent env vars — the dotenv loader reads it on every gateway start. Do NOT rely on the systemd unit for custom env vars.
+
+### Tailscale serve + funnel: per-path isolation doesn't isolate
+
+`tailscale serve` (tailnet-only) and `tailscale funnel` (public) write to the same serve config object. If any path on a port is funnel-enabled, the **entire port** becomes funnel-enabled — including paths added via `tailscale serve`. The CLI's per-path display is misleading; it lists tailnet-only and public paths together under "Funnel on", but the actual gating is per-port, not per-path.
+
+Hit 2026-05-18 setting up hermes-webui alongside the Sendblue funnel. First attempt: `tailscale funnel ... /sendblue-gateway/receive` + `tailscale serve / http://localhost:8787`. Result: WebUI's `/` was reachable from the public internet (302 to login page), not tailnet-only.
+
+Counter: use **different ports** for funnel vs serve to get clean isolation. Funnel on :443, Serve on :8443 (or :10000). Tailscale Funnel supports only 443/8443/10000, so the second listener has to be one of those. Current split: funnel `:443/sendblue-gateway/receive` (public, Sendblue), serve `:8443/` (tailnet-only, WebUI).
 
 ### Mixed mental models of "filed upstream" vs "deployed locally"
 
