@@ -532,9 +532,15 @@ def fetch_nous_account_tier(access_token: str, portal_base_url: str = "") -> dic
 def is_nous_free_tier(account_info: dict[str, Any]) -> bool:
     """Return True if the account info indicates a free (unpaid) tier.
 
-    Checks ``subscription.monthly_charge == 0``.  Returns False when
-    the field is missing or unparseable (assumes paid — don't block users).
+    Checks ``subscription.monthly_charge == 0`` AND whether the user has
+    paid service access (via purchased credits).  Returns False when
+    fields are missing or unparseable (assumes paid — don't block users).
     """
+    # Users with purchased credits get paid_service_access even on Free plan
+    paid_access = account_info.get("paid_service_access")
+    if isinstance(paid_access, dict) and paid_access.get("allowed"):
+        return False
+
     sub = account_info.get("subscription")
     if not isinstance(sub, dict):
         return False
