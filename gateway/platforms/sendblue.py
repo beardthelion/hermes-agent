@@ -19,6 +19,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -48,6 +49,7 @@ DEFAULT_WEBHOOK_PORT = 8665
 DEFAULT_WEBHOOK_PATH = "/sendblue-gateway/receive"
 MAX_TEXT_LENGTH = 18996
 MAX_WEBHOOK_BODY_BYTES = 1_048_576
+DEDUP_CAPACITY = 10_000
 SIGNATURE_HEADER = "sb-signing-secret"
 SENDBLUE_API_BASE = "https://api.sendblue.com/api"
 
@@ -161,8 +163,28 @@ class SendblueAdapter(BasePlatformAdapter):
             or os.getenv("SENDBLUE_DEFAULT_SEND_STYLE", "")
         )
         self._quota_cache: Dict[str, Dict[str, Any]] = {}
+        # Bounded LRU set of recently-seen message_handles for webhook
+        # dedup. Sendblue retries on 5xx/timeout; the same delivery may
+        # land multiple times. Single-threaded asyncio + no awaits during
+        # check/insert means no lock is needed.
+        self._seen_handles: "OrderedDict[str, None]" = OrderedDict()
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
+
+    def _is_duplicate(self, message_handle: str) -> bool:
+        """Return True if this handle was processed recently; otherwise
+        record it and return False. Empty handles are never deduped
+        (some Sendblue events legitimately omit the field).
+        """
+        if not message_handle:
+            return False
+        if message_handle in self._seen_handles:
+            self._seen_handles.move_to_end(message_handle)
+            return True
+        self._seen_handles[message_handle] = None
+        while len(self._seen_handles) > DEDUP_CAPACITY:
+            self._seen_handles.popitem(last=False)
+        return False
 
     # ------------------------------------------------------------------
     # API helpers
@@ -716,6 +738,15 @@ class SendblueAdapter(BasePlatformAdapter):
             ) or ""
             from_number = item.get("from_number", "")
             msg_handle = item.get("message_handle", "")
+            # -- STEP 3d.5: Webhook dedup --
+            # Sendblue retries on 5xx/timeout. The same message_handle
+            # landing twice means a retry, not a new message.
+            if self._is_duplicate(msg_handle):
+                logger.debug(
+                    "[sendblue] duplicate webhook for message_handle=%s — skipping",
+                    msg_handle,
+                )
+                continue
             media_url = (item.get("media_url") or "").strip() or None
             group_id = (item.get("group_id") or "").strip()
             group_display_name = (item.get("group_display_name") or "").strip()

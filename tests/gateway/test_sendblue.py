@@ -171,6 +171,82 @@ class TestSendblueWebhookBodyCap:
         assert adapter.handle_message.call_count == 1
 
 
+class TestSendblueWebhookDedup:
+    """Sendblue retries webhooks on 5xx/timeout. The adapter must dedupe
+    by message_handle so a single inbound never dispatches twice.
+    """
+    @pytest.mark.asyncio
+    async def test_duplicate_message_handle_only_dispatches_once(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            "content": "hello",
+            "message_handle": "handle-abc",
+        }
+        headers = {"sb-signing-secret": "test-webhook-secret"}
+        first = await adapter._handle_webhook(_MockRequest(body=payload, headers=headers))
+        second = await adapter._handle_webhook(_MockRequest(body=payload, headers=headers))
+        await _drain_background_tasks(adapter)
+        assert first.status == 200
+        assert second.status == 200
+        assert adapter.handle_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_distinct_handles_both_dispatch(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        base = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            "content": "hello",
+        }
+        headers = {"sb-signing-secret": "test-webhook-secret"}
+        await adapter._handle_webhook(_MockRequest(
+            body={**base, "message_handle": "handle-1"}, headers=headers,
+        ))
+        await adapter._handle_webhook(_MockRequest(
+            body={**base, "message_handle": "handle-2"}, headers=headers,
+        ))
+        await _drain_background_tasks(adapter)
+        assert adapter.handle_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_handle_is_not_deduped(self, monkeypatch):
+        """Some Sendblue events omit message_handle; we must not collapse
+        them all into the empty-string bucket."""
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "is_outbound": False,
+            "sendblue_number": "+15555550100",
+            "from_number": "+17766768883",
+            "content": "hello",
+            # no message_handle
+        }
+        headers = {"sb-signing-secret": "test-webhook-secret"}
+        await adapter._handle_webhook(_MockRequest(body=payload, headers=headers))
+        await adapter._handle_webhook(_MockRequest(body=payload, headers=headers))
+        await _drain_background_tasks(adapter)
+        assert adapter.handle_message.call_count == 2
+
+    def test_dedup_set_is_bounded(self, monkeypatch):
+        import gateway.platforms.sendblue as sb
+        adapter = _make_adapter(monkeypatch)
+        # Fill past capacity; oldest entries must be evicted.
+        for i in range(sb.DEDUP_CAPACITY + 50):
+            assert adapter._is_duplicate(f"h-{i}") is False
+        assert len(adapter._seen_handles) == sb.DEDUP_CAPACITY
+        # Oldest 50 should have been evicted; their handles are no
+        # longer in the set, so re-presenting them reads as fresh.
+        assert adapter._is_duplicate("h-0") is False
+        # Most-recent is still remembered.
+        assert adapter._is_duplicate(f"h-{sb.DEDUP_CAPACITY + 49}") is True
+
+
 class TestSendblueWebhookTypingIndicator:
     """Typing-indicator webhooks must not be dispatched as messages.
 
