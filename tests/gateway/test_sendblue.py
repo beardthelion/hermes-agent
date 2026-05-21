@@ -39,11 +39,12 @@ class _MockRequest:
     json_error to make .json() raise that exception (used to test the
     JSONDecodeError → 400 path).
     """
-    def __init__(self, body=None, headers=None, remote="127.0.0.1", json_error=None):
+    def __init__(self, body=None, headers=None, remote="127.0.0.1", json_error=None, content_length=0):
         self._body = body
         self.headers = headers or {}
         self.remote = remote
         self._json_error = json_error
+        self.content_length = content_length
 
     async def json(self):
         if self._json_error is not None:
@@ -123,6 +124,51 @@ class TestSendblueSignatureVerification:
         monkeypatch.setattr(sb, "hmac", type("M", (), {"compare_digest": spy}))
         assert adapter._verify_signature("abc123") is True
         assert called["hit"] is True
+
+
+class TestSendblueWebhookBodyCap:
+    """Reject oversized webhook bodies with 413 before doing any work.
+
+    Sendblue webhook payloads are small JSON (a few KB at most — media is
+    referenced by URL, not inlined). A 1 MiB cap is generous and protects
+    against DoS if the signing secret leaks (or signature verification is
+    disabled).
+    """
+    @pytest.mark.asyncio
+    async def test_oversized_body_returns_413_before_signature_check(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        # Content-Length over the cap, no signature header — should still
+        # reject with 413 (size check fires before signature verification).
+        request = _MockRequest(
+            body={"is_outbound": False, "from_number": "+17766768883", "content": "x"},
+            headers={},
+            content_length=10 * 1024 * 1024,  # 10 MiB
+        )
+        response = await adapter._handle_webhook(request)
+        assert response.status == 413
+        assert adapter.handle_message.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_body_at_cap_is_accepted(self, monkeypatch):
+        import gateway.platforms.sendblue as sb
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        # Exactly the cap is allowed; size > cap is rejected.
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17766768883",
+                "content": "hi",
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+            content_length=sb.MAX_WEBHOOK_BODY_BYTES,
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+        assert adapter.handle_message.call_count == 1
 
 
 class TestSendblueSendEmptyChunks:

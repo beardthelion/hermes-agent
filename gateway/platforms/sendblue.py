@@ -47,6 +47,7 @@ DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 DEFAULT_WEBHOOK_PORT = 8665
 DEFAULT_WEBHOOK_PATH = "/sendblue-gateway/receive"
 MAX_TEXT_LENGTH = 18996
+MAX_WEBHOOK_BODY_BYTES = 1_048_576
 SIGNATURE_HEADER = "sb-signing-secret"
 SENDBLUE_API_BASE = "https://api.sendblue.com/api"
 
@@ -649,6 +650,13 @@ class SendblueAdapter(BasePlatformAdapter):
         DM-only assumption.
         """
         from aiohttp import web
+
+        # -- STEP 0: Body size cap --
+        # Sendblue payloads are small JSON (media is referenced by URL).
+        # Reject oversized bodies before crypto so a leaked secret can't
+        # turn the webhook into a DoS surface.
+        if (request.content_length or 0) > MAX_WEBHOOK_BODY_BYTES:
+            return web.json_response({"error": "payload too large"}, status=413)
 
         # -- STEP 1: Signature verification --
         secret = request.headers.get(SIGNATURE_HEADER, "")
