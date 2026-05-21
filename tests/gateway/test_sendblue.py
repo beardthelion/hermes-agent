@@ -1496,3 +1496,103 @@ class TestSendblueMarkReadTaskTracking:
         # After completion, the discard callback should have removed it
         assert all(not t.get_coro().__qualname__.endswith("slow_mark_read")
                    for t in adapter._background_tasks)
+
+
+class TestSendblueReactions:
+    """Reactions stack: per-chat last-inbound cache populated from
+    webhooks + send_reaction POST shape + targeting fallback.
+    """
+    @pytest.mark.asyncio
+    async def test_webhook_populates_last_inbound_handle(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17766768883",
+                "content": "hi",
+                "message_handle": "handle-xyz",
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert adapter._last_inbound_handle["+17766768883"] == "handle-xyz"
+
+    @pytest.mark.asyncio
+    async def test_webhook_caches_group_handle_by_group_id(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        group_id = "550e8400-e29b-41d4-a716-446655440000"
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17766768883",
+                "content": "hi",
+                "message_handle": "group-handle",
+                "group_id": group_id,
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert adapter._last_inbound_handle[group_id] == "group-handle"
+
+    @pytest.mark.asyncio
+    async def test_send_reaction_posts_correct_payload(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(return_value=(200, {}))
+        adapter._last_inbound_handle["+17766768883"] = "handle-abc"
+        ok = await adapter.send_reaction("+17766768883", "love")
+        assert ok is True
+        adapter._sendblue_api_post.assert_called_once_with(
+            "send-reaction",
+            {
+                "from_number": "+15555550100",
+                "message_handle": "handle-abc",
+                "reaction": "love",
+            },
+            timeout=5.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_reaction_accepts_explicit_handle(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(return_value=(202, {}))
+        # Cache empty, but caller passes the handle directly.
+        ok = await adapter.send_reaction(
+            "+17766768883", "Laugh", message_handle="explicit-handle",
+        )
+        assert ok is True
+        called = adapter._sendblue_api_post.call_args
+        assert called.args[1]["message_handle"] == "explicit-handle"
+        # Reaction is lowercased to match Sendblue's enum.
+        assert called.args[1]["reaction"] == "laugh"
+
+    @pytest.mark.asyncio
+    async def test_send_reaction_rejects_invalid_reaction(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock()
+        adapter._last_inbound_handle["+17766768883"] = "handle-abc"
+        ok = await adapter.send_reaction("+17766768883", "wave")
+        assert ok is False
+        adapter._sendblue_api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_reaction_no_handle_available(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock()
+        # Cache empty, no explicit handle → fail without API call.
+        ok = await adapter.send_reaction("+17766768883", "like")
+        assert ok is False
+        adapter._sendblue_api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_reaction_api_failure_returns_false(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(return_value=(500, "boom"))
+        adapter._last_inbound_handle["+17766768883"] = "handle-abc"
+        ok = await adapter.send_reaction("+17766768883", "like")
+        assert ok is False

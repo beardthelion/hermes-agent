@@ -50,6 +50,13 @@ DEFAULT_WEBHOOK_PATH = "/sendblue-gateway/receive"
 MAX_TEXT_LENGTH = 18996
 MAX_WEBHOOK_BODY_BYTES = 1_048_576
 DEDUP_CAPACITY = 10_000
+
+# Sendblue's six tapback reaction types. The /api/send-reaction endpoint
+# accepts any non-empty string at the gate, so client-side validation
+# is load-bearing.
+REACTION_TYPES = frozenset({
+    "love", "like", "dislike", "laugh", "emphasize", "question",
+})
 SIGNATURE_HEADER = "sb-signing-secret"
 SENDBLUE_API_BASE = "https://api.sendblue.com/api"
 
@@ -168,6 +175,10 @@ class SendblueAdapter(BasePlatformAdapter):
         # land multiple times. Single-threaded asyncio + no awaits during
         # check/insert means no lock is needed.
         self._seen_handles: "OrderedDict[str, None]" = OrderedDict()
+        # Per-chat last-inbound message_handle for reactions. The LLM
+        # targets reactions implicitly ("react to the message I just
+        # got"); the adapter resolves chat_id → handle from this dict.
+        self._last_inbound_handle: Dict[str, str] = {}
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
 
@@ -755,6 +766,12 @@ class SendblueAdapter(BasePlatformAdapter):
             # number. In a DM, both are the same effectively (chat_id is
             # the other party's phone).
             chat_id = group_id if is_group else from_number
+
+            # -- STEP 3d.7: Record last-inbound handle for reactions --
+            # Tools like sendblue_react look up the most recent handle
+            # by chat_id to target tapbacks.
+            if chat_id and msg_handle:
+                self._last_inbound_handle[chat_id] = msg_handle
 
             # -- STEP 3e: Media handling --
             media_urls: List[str] = []
@@ -1379,6 +1396,51 @@ class SendblueAdapter(BasePlatformAdapter):
             return True
         logger.warning(
             "[sendblue] mark_read failed (%d): %s", status, str(body)[:200]
+        )
+        return False
+
+    async def send_reaction(
+        self,
+        chat_id: str,
+        reaction: str,
+        message_handle: Optional[str] = None,
+    ) -> bool:
+        """Send an iMessage tapback reaction to a recent inbound message.
+
+        POST /api/send-reaction. If message_handle is omitted, resolves
+        to the most recent inbound handle for chat_id from the in-memory
+        cache (populated as inbound webhooks arrive).
+
+        Returns True on 200/202, False otherwise (and on invalid input).
+        """
+        reaction = (reaction or "").strip().lower()
+        if reaction not in REACTION_TYPES:
+            logger.warning(
+                "[sendblue] send_reaction: invalid reaction %r (valid: %s)",
+                reaction, sorted(REACTION_TYPES),
+            )
+            return False
+        if not message_handle:
+            message_handle = self._last_inbound_handle.get(chat_id, "")
+        if not message_handle:
+            logger.warning(
+                "[sendblue] send_reaction: no message_handle available for chat %s",
+                chat_id,
+            )
+            return False
+        status, body = await self._sendblue_api_post(
+            "send-reaction",
+            {
+                "from_number": self.sendblue_number,
+                "message_handle": message_handle,
+                "reaction": reaction,
+            },
+            timeout=5.0,
+        )
+        if status in (200, 202):
+            return True
+        logger.warning(
+            "[sendblue] send_reaction failed (%d): %s", status, str(body)[:200]
         )
         return False
 
