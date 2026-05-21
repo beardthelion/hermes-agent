@@ -861,6 +861,64 @@ class TestSendblueReadReceiptsAndTyping:
         await _drain_background_tasks(adapter)
         adapter.mark_read.assert_called_once_with("+17766768883")
 
+    @pytest.mark.asyncio
+    async def test_webhook_skips_mark_read_for_sms(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        adapter.mark_read = AsyncMock(return_value=True)
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17766768883",
+                "content": "hello",
+                "service": "sms",
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        assert response.status == 200
+        await _drain_background_tasks(adapter)
+        adapter.mark_read.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_webhook_skips_mark_read_for_rcs(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        adapter.mark_read = AsyncMock(return_value=True)
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17766768883",
+                "content": "hello",
+                "service": "RCS",
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        adapter.mark_read.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_webhook_dispatches_mark_read_when_service_missing(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        adapter.mark_read = AsyncMock(return_value=True)
+        request = _MockRequest(
+            body={
+                "is_outbound": False,
+                "sendblue_number": "+15555550100",
+                "from_number": "+17766768883",
+                "content": "hello",
+                # no `service` field — older payloads, forward-compat default
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        adapter.mark_read.assert_called_once_with("+17766768883")
+
 
 class TestSendblueSendStyle:
     def test_normalize_valid_style_lowercased(self, monkeypatch):

@@ -799,9 +799,15 @@ class SendblueAdapter(BasePlatformAdapter):
             # -- STEP 3i: Fire-and-forget read receipt --
             # Sendblue's mark-read API targets a DM by the other party's
             # number. There's no documented per-group mark-read, so skip
-            # for group messages. Track the task so adapter shutdown can
-            # await it cleanly instead of GC-cancelling mid-flight.
-            if self.send_read_receipts and not is_group:
+            # for group messages. Read receipts are an iMessage-only
+            # feature — calling mark_read on SMS/RCS errors at the API
+            # gate, so gate on service when the field is present (default
+            # to allowed when missing for forward-compat). Track the task
+            # so adapter shutdown can await it cleanly instead of
+            # GC-cancelling mid-flight.
+            service = (item.get("service") or "").lower()
+            service_supports_read = service in ("", "imessage")
+            if self.send_read_receipts and not is_group and service_supports_read:
                 read_task = asyncio.create_task(self.mark_read(from_number))
                 self._background_tasks.add(read_task)
                 read_task.add_done_callback(self._background_tasks.discard)
