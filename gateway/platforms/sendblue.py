@@ -674,6 +674,15 @@ class SendblueAdapter(BasePlatformAdapter):
             logger.error("[sendblue] webhook parse error: %s", exc)
             return web.json_response({"error": "invalid payload"}, status=400)
 
+        # -- STEP 2.5: Short-circuit typing-indicator webhooks --
+        # Sendblue posts typing_indicator events with an `is_typing` field
+        # and no message content. Dispatching them as messages would feed
+        # the agent an empty turn.
+        if isinstance(body, dict) and "is_typing" in body:
+            return web.json_response(
+                {"status": "ok", "event": "typing_indicator"}, status=200
+            )
+
         items = body if isinstance(body, list) else [body]
 
         # -- STEP 3: Per-message loop --
@@ -682,8 +691,10 @@ class SendblueAdapter(BasePlatformAdapter):
                 logger.debug("[sendblue] skipping non-dict item: %r", item)
                 continue
 
-            # -- STEP 3a: Skip outbound echoes --
+            # -- STEP 3a: Skip outbound echoes / typing events --
             if item.get("is_outbound"):
+                continue
+            if "is_typing" in item:
                 continue
 
             # -- STEP 3b: Routing filter -- is this for our number? --

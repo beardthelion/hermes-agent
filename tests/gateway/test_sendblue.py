@@ -171,6 +171,46 @@ class TestSendblueWebhookBodyCap:
         assert adapter.handle_message.call_count == 1
 
 
+class TestSendblueWebhookTypingIndicator:
+    """Typing-indicator webhooks must not be dispatched as messages.
+
+    Sendblue posts typing_indicator events with an `is_typing` field and
+    no message content. Forwarding them as MessageEvents would feed the
+    agent an empty turn.
+    """
+    @pytest.mark.asyncio
+    async def test_typing_indicator_returns_200_without_dispatch(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        request = _MockRequest(
+            body={
+                "from_number": "+17766768883",
+                "sendblue_number": "+15555550100",
+                "is_typing": True,
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        response = await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert response.status == 200
+
+    @pytest.mark.asyncio
+    async def test_typing_indicator_does_not_call_handle_message(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+        request = _MockRequest(
+            body={
+                "from_number": "+17766768883",
+                "sendblue_number": "+15555550100",
+                "is_typing": False,  # stopped-typing event also short-circuits
+            },
+            headers={"sb-signing-secret": "test-webhook-secret"},
+        )
+        await adapter._handle_webhook(request)
+        await _drain_background_tasks(adapter)
+        assert adapter.handle_message.call_count == 0
+
+
 class TestSendblueSendEmptyChunks:
     @pytest.mark.asyncio
     async def test_multibubble_blank_paragraphs_returns_failure(self, monkeypatch):
