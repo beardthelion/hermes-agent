@@ -141,7 +141,7 @@ class TestSendblueWebhookBodyCap:
         # Content-Length over the cap, no signature header — should still
         # reject with 413 (size check fires before signature verification).
         request = _MockRequest(
-            body={"is_outbound": False, "from_number": "+17766768883", "content": "x"},
+            body={"is_outbound": False, "from_number": "+17706768883", "content": "x"},
             headers={},
             content_length=10 * 1024 * 1024,  # 10 MiB
         )
@@ -159,7 +159,7 @@ class TestSendblueWebhookBodyCap:
             body={
                 "is_outbound": False,
                 "sendblue_number": "+15555550100",
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "content": "hi",
             },
             headers={"sb-signing-secret": "test-webhook-secret"},
@@ -182,7 +182,7 @@ class TestSendblueWebhookDedup:
         payload = {
             "is_outbound": False,
             "sendblue_number": "+15555550100",
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             "content": "hello",
             "message_handle": "handle-abc",
         }
@@ -201,7 +201,7 @@ class TestSendblueWebhookDedup:
         base = {
             "is_outbound": False,
             "sendblue_number": "+15555550100",
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             "content": "hello",
         }
         headers = {"sb-signing-secret": "test-webhook-secret"}
@@ -223,7 +223,7 @@ class TestSendblueWebhookDedup:
         payload = {
             "is_outbound": False,
             "sendblue_number": "+15555550100",
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             "content": "hello",
             # no message_handle
         }
@@ -260,7 +260,7 @@ class TestSendblueWebhookTypingIndicator:
         adapter.handle_message = AsyncMock()
         request = _MockRequest(
             body={
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "sendblue_number": "+15555550100",
                 "is_typing": True,
             },
@@ -276,7 +276,7 @@ class TestSendblueWebhookTypingIndicator:
         adapter.handle_message = AsyncMock()
         request = _MockRequest(
             body={
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "sendblue_number": "+15555550100",
                 "is_typing": False,  # stopped-typing event also short-circuits
             },
@@ -313,7 +313,7 @@ class TestSendblueWebhookRouting:
         payload = {
             "is_outbound": False,
             "sendblue_number": "+15555550100",
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             "content": "hello",
         }
         request = _MockRequest(
@@ -332,7 +332,7 @@ class TestSendblueWebhookRouting:
         payload = {
             "is_outbound": False,
             "sendblue_number": "+15555559999",  # NOT our number
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             "content": "hello",
         }
         request = _MockRequest(
@@ -352,7 +352,7 @@ class TestSendblueWebhookRouting:
         payload = {
             "is_outbound": False,
             "sendblue_number": "+15555559999",  # any number
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             "content": "hello",
         }
         request = _MockRequest(
@@ -373,7 +373,7 @@ class TestSendblueWebhookParsing:
         payload = {
             "is_outbound": False,
             "sendblue_number": "+15555550100",
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             "content": "hello",
         }
         request = _MockRequest(
@@ -392,7 +392,7 @@ class TestSendblueWebhookParsing:
         item = {
             "is_outbound": False,
             "sendblue_number": "+15555550100",
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             "content": "hello",
         }
         request = _MockRequest(
@@ -444,7 +444,7 @@ class TestSendblueWebhookParsing:
         payload = {
             "is_outbound": False,
             "sendblue_number": "+15555550100",
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             # no content, no media_url — no text source at all
         }
         request = _MockRequest(
@@ -578,7 +578,7 @@ class TestSendblueMediaDownload:
             body={
                 "is_outbound": False,
                 "sendblue_number": "+15555550100",
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "media_url": "https://cdn.sendblue.com/audio/voice.caf",
             },
             headers={"sb-signing-secret": "test-webhook-secret"},
@@ -621,7 +621,7 @@ class TestSendblueMediaDownload:
         payload = {
             "is_outbound": False,
             "sendblue_number": "+15555550100",
-            "from_number": "+17766768883",
+            "from_number": "+17706768883",
             # no content
             "media_url": "https://cdn.sendblue.com/img/test.jpg",
         }
@@ -642,13 +642,13 @@ class TestSendblueOutboundSend:
         adapter._sendblue_api_post = AsyncMock(
             return_value=(200, '{"message_handle": "abc"}')
         )
-        result = await adapter.send("+17766768883", "hello")
+        result = await adapter.send("+17706768883", "hello")
         assert result.success is True
         assert result.message_id == "abc"
         adapter._sendblue_api_post.assert_called_once_with(
             "send-message",
             {
-                "number": "+17766768883",
+                "number": "+17706768883",
                 "from_number": "+15555550100",
                 "content": "hello",
             },
@@ -662,7 +662,7 @@ class TestSendblueOutboundSend:
         )
         # 20000 chars > 18996 MAX_MESSAGE_LENGTH — inherited truncate_message
         # should split into multiple chunks, each POSTed separately
-        result = await adapter.send("+17766768883", "X" * 20000)
+        result = await adapter.send("+17706768883", "X" * 20000)
         assert result.success is True
         assert adapter._sendblue_api_post.call_count > 1
 
@@ -670,7 +670,7 @@ class TestSendblueOutboundSend:
     async def test_empty_content_returns_failure(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         adapter._sendblue_api_post = AsyncMock()
-        result = await adapter.send("+17766768883", "")
+        result = await adapter.send("+17706768883", "")
         assert result.success is False
         assert "non-empty" in result.error
         adapter._sendblue_api_post.assert_not_called()
@@ -682,7 +682,7 @@ class TestSendblueOutboundSend:
         adapter._sendblue_api_post = AsyncMock(
             return_value=(0, "connection error")
         )
-        result = await adapter.send("+17766768883", "hello")
+        result = await adapter.send("+17706768883", "hello")
         assert result.success is False
         assert result.retryable is True
 
@@ -692,7 +692,7 @@ class TestSendblueOutboundSend:
         adapter._sendblue_api_post = AsyncMock(
             return_value=(400, '{"error": "bad request"}')
         )
-        result = await adapter.send("+17766768883", "hello")
+        result = await adapter.send("+17706768883", "hello")
         assert result.success is False
         assert result.retryable is False
 
@@ -724,7 +724,7 @@ class TestSendblueSendImage:
             return_value=(200, '{"message_handle": "img-abc"}')
         )
         result = await adapter.send_image(
-            "+17766768883",
+            "+17706768883",
             "https://cdn.example.com/img.jpg",
             caption=None,
         )
@@ -733,7 +733,7 @@ class TestSendblueSendImage:
         adapter._sendblue_api_post.assert_called_once_with(
             "send-message",
             {
-                "number": "+17766768883",
+                "number": "+17706768883",
                 "from_number": "+15555550100",
                 "media_url": "https://cdn.example.com/img.jpg",
             },
@@ -746,7 +746,7 @@ class TestSendblueSendImage:
             return_value=(200, '{"message_handle": "img-xyz"}')
         )
         result = await adapter.send_image(
-            "+17766768883",
+            "+17706768883",
             "https://cdn.example.com/img.jpg",
             caption="look at this",
         )
@@ -754,7 +754,7 @@ class TestSendblueSendImage:
         adapter._sendblue_api_post.assert_called_once_with(
             "send-message",
             {
-                "number": "+17766768883",
+                "number": "+17706768883",
                 "from_number": "+15555550100",
                 "media_url": "https://cdn.example.com/img.jpg",
                 "content": "look at this",
@@ -771,7 +771,7 @@ class TestSendblueSendImage:
             super_send_image,
         )
         await adapter.send_image(
-            "+17766768883",
+            "+17706768883",
             "http://cdn.example.com/img.jpg",  # http, not https
             caption="hi",
         )
@@ -785,7 +785,7 @@ class TestSendblueSendImage:
             return_value=(400, '{"error": "invalid media_url"}')
         )
         result = await adapter.send_image(
-            "+17766768883",
+            "+17706768883",
             "https://cdn.example.com/img.jpg",
         )
         assert result.success is False
@@ -862,7 +862,7 @@ class TestSendblueQuotaCommand:
             body={
                 "is_outbound": False,
                 "sendblue_number": "+15555550100",
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "content": "/quota",
                 "message_handle": "abc",
             },
@@ -883,11 +883,11 @@ class TestSendblueReadReceiptsAndTyping:
     async def test_mark_read_posts_correct_payload(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         adapter._sendblue_api_post = AsyncMock(return_value=(200, {}))
-        ok = await adapter.mark_read("+17766768883")
+        ok = await adapter.mark_read("+17706768883")
         assert ok is True
         adapter._sendblue_api_post.assert_called_once_with(
             "mark-read",
-            {"number": "+17766768883", "from_number": "+15555550100"},
+            {"number": "+17706768883", "from_number": "+15555550100"},
             timeout=5.0,
         )
 
@@ -895,7 +895,7 @@ class TestSendblueReadReceiptsAndTyping:
     async def test_mark_read_disabled_when_flag_false(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, send_read_receipts=False)
         adapter._sendblue_api_post = AsyncMock()
-        ok = await adapter.mark_read("+17766768883")
+        ok = await adapter.mark_read("+17706768883")
         assert ok is False
         adapter._sendblue_api_post.assert_not_called()
 
@@ -903,18 +903,18 @@ class TestSendblueReadReceiptsAndTyping:
     async def test_mark_read_failure_returns_false(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         adapter._sendblue_api_post = AsyncMock(return_value=(400, "bad"))
-        ok = await adapter.mark_read("+17766768883")
+        ok = await adapter.mark_read("+17706768883")
         assert ok is False
 
     @pytest.mark.asyncio
     async def test_send_typing_posts_correct_payload(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         adapter._sendblue_api_post = AsyncMock(return_value=(200, {}))
-        result = await adapter.send_typing("+17766768883")
+        result = await adapter.send_typing("+17706768883")
         assert result is None
         adapter._sendblue_api_post.assert_called_once_with(
             "send-typing-indicator",
-            {"number": "+17766768883", "from_number": "+15555550100"},
+            {"number": "+17706768883", "from_number": "+15555550100"},
             timeout=5.0,
         )
 
@@ -927,7 +927,7 @@ class TestSendblueReadReceiptsAndTyping:
             body={
                 "is_outbound": False,
                 "sendblue_number": "+15555550100",
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "content": "hello",
             },
             headers={"sb-signing-secret": "test-webhook-secret"},
@@ -935,7 +935,7 @@ class TestSendblueReadReceiptsAndTyping:
         response = await adapter._handle_webhook(request)
         assert response.status == 200
         await _drain_background_tasks(adapter)
-        adapter.mark_read.assert_called_once_with("+17766768883")
+        adapter.mark_read.assert_called_once_with("+17706768883")
 
     @pytest.mark.asyncio
     async def test_webhook_skips_mark_read_for_sms(self, monkeypatch):
@@ -946,7 +946,7 @@ class TestSendblueReadReceiptsAndTyping:
             body={
                 "is_outbound": False,
                 "sendblue_number": "+15555550100",
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "content": "hello",
                 "service": "sms",
             },
@@ -966,7 +966,7 @@ class TestSendblueReadReceiptsAndTyping:
             body={
                 "is_outbound": False,
                 "sendblue_number": "+15555550100",
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "content": "hello",
                 "service": "RCS",
             },
@@ -985,7 +985,7 @@ class TestSendblueReadReceiptsAndTyping:
             body={
                 "is_outbound": False,
                 "sendblue_number": "+15555550100",
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "content": "hello",
                 # no `service` field — older payloads, forward-compat default
             },
@@ -993,7 +993,7 @@ class TestSendblueReadReceiptsAndTyping:
         )
         await adapter._handle_webhook(request)
         await _drain_background_tasks(adapter)
-        adapter.mark_read.assert_called_once_with("+17766768883")
+        adapter.mark_read.assert_called_once_with("+17706768883")
 
 
 class TestSendblueSendStyle:
@@ -1510,7 +1510,7 @@ class TestSendblueReactions:
             body={
                 "is_outbound": False,
                 "sendblue_number": "+15555550100",
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "content": "hi",
                 "message_handle": "handle-xyz",
             },
@@ -1518,7 +1518,7 @@ class TestSendblueReactions:
         )
         await adapter._handle_webhook(request)
         await _drain_background_tasks(adapter)
-        assert adapter._last_inbound_handle["+17766768883"] == "handle-xyz"
+        assert adapter._last_inbound_handle["+17706768883"] == "handle-xyz"
 
     @pytest.mark.asyncio
     async def test_webhook_caches_group_handle_by_group_id(self, monkeypatch):
@@ -1529,7 +1529,7 @@ class TestSendblueReactions:
             body={
                 "is_outbound": False,
                 "sendblue_number": "+15555550100",
-                "from_number": "+17766768883",
+                "from_number": "+17706768883",
                 "content": "hi",
                 "message_handle": "group-handle",
                 "group_id": group_id,
@@ -1544,8 +1544,8 @@ class TestSendblueReactions:
     async def test_send_reaction_posts_correct_payload(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         adapter._sendblue_api_post = AsyncMock(return_value=(200, {}))
-        adapter._last_inbound_handle["+17766768883"] = "handle-abc"
-        ok = await adapter.send_reaction("+17766768883", "love")
+        adapter._last_inbound_handle["+17706768883"] = "handle-abc"
+        ok = await adapter.send_reaction("+17706768883", "love")
         assert ok is True
         adapter._sendblue_api_post.assert_called_once_with(
             "send-reaction",
@@ -1563,7 +1563,7 @@ class TestSendblueReactions:
         adapter._sendblue_api_post = AsyncMock(return_value=(202, {}))
         # Cache empty, but caller passes the handle directly.
         ok = await adapter.send_reaction(
-            "+17766768883", "Laugh", message_handle="explicit-handle",
+            "+17706768883", "Laugh", message_handle="explicit-handle",
         )
         assert ok is True
         called = adapter._sendblue_api_post.call_args
@@ -1575,8 +1575,8 @@ class TestSendblueReactions:
     async def test_send_reaction_rejects_invalid_reaction(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         adapter._sendblue_api_post = AsyncMock()
-        adapter._last_inbound_handle["+17766768883"] = "handle-abc"
-        ok = await adapter.send_reaction("+17766768883", "wave")
+        adapter._last_inbound_handle["+17706768883"] = "handle-abc"
+        ok = await adapter.send_reaction("+17706768883", "wave")
         assert ok is False
         adapter._sendblue_api_post.assert_not_called()
 
@@ -1585,7 +1585,7 @@ class TestSendblueReactions:
         adapter = _make_adapter(monkeypatch)
         adapter._sendblue_api_post = AsyncMock()
         # Cache empty, no explicit handle → fail without API call.
-        ok = await adapter.send_reaction("+17766768883", "like")
+        ok = await adapter.send_reaction("+17706768883", "like")
         assert ok is False
         adapter._sendblue_api_post.assert_not_called()
 
@@ -1593,8 +1593,8 @@ class TestSendblueReactions:
     async def test_send_reaction_api_failure_returns_false(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         adapter._sendblue_api_post = AsyncMock(return_value=(500, "boom"))
-        adapter._last_inbound_handle["+17766768883"] = "handle-abc"
-        ok = await adapter.send_reaction("+17766768883", "like")
+        adapter._last_inbound_handle["+17706768883"] = "handle-abc"
+        ok = await adapter.send_reaction("+17706768883", "like")
         assert ok is False
 
 
@@ -1634,7 +1634,7 @@ class TestSendblueStatusCallback:
     async def test_send_text_no_callback_by_default(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         adapter._sendblue_api_post = AsyncMock(return_value=(200, "{}"))
-        await adapter.send("+17766768883", "hi")
+        await adapter.send("+17706768883", "hi")
         payload = adapter._sendblue_api_post.call_args[0][1]
         assert "status_callback" not in payload
 
@@ -1643,7 +1643,7 @@ class TestSendblueStatusCallback:
         url = "https://example.com/sendblue/status"
         adapter = _make_adapter(monkeypatch, status_callback_url=url)
         adapter._sendblue_api_post = AsyncMock(return_value=(200, "{}"))
-        await adapter.send("+17766768883", "hi")
+        await adapter.send("+17706768883", "hi")
         payload = adapter._sendblue_api_post.call_args[0][1]
         assert payload.get("status_callback") == url
 
@@ -1710,7 +1710,7 @@ class TestSendbluePollMessagesOnce:
         adapter._sendblue_api_get = AsyncMock(return_value=(200, {
             "messages": [
                 {
-                    "from_number": "+17766768883",
+                    "from_number": "+17706768883",
                     "content": "hello from poll",
                     "message_handle": "h-new-1",
                     "created_at": "2026-05-21T22:00:00.000Z",
@@ -1732,7 +1732,7 @@ class TestSendbluePollMessagesOnce:
         adapter._sendblue_api_get = AsyncMock(return_value=(200, {
             "messages": [
                 {
-                    "from_number": "+17766768883",
+                    "from_number": "+17706768883",
                     "content": "dup",
                     "message_handle": "h-old",
                     "created_at": "2026-05-21T22:00:00.000Z",
