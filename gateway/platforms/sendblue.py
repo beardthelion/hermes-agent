@@ -1,12 +1,15 @@
-"""Sendblue iMessage platform adapter.
+"""Sendblue iMessage / SMS / RCS platform adapter.
 
 Uses Sendblue's cloud relay for outbound REST sends and inbound
-webhooks. Provides iMessage access for non-Mac users (BlueBubbles
+webhooks. Provides messaging access for non-Mac users (BlueBubbles
 requires a macOS server; Sendblue is a hosted alternative).
 
-MVP supports text messaging and inbound image caching.
-send_image() outbound uses URL passthrough (Sendblue fetches from
-public CDN). Audio/document attachments deferred.
+Sendblue auto-detects the underlying transport per recipient:
+iMessage when the destination is an Apple device, SMS/RCS as
+carrier-side fallbacks. Features that are iMessage-only (read
+receipts, typing indicators, tapback reactions, send effects) are
+gated on the inbound ``service`` field — calls are skipped cleanly
+for SMS/RCS deliveries.
 
 Architecture pattern modeled on bluebubbles.py.
 """
