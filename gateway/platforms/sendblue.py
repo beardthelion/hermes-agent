@@ -738,145 +738,157 @@ class SendblueAdapter(BasePlatformAdapter):
             if not isinstance(item, dict):
                 logger.debug("[sendblue] skipping non-dict item: %r", item)
                 continue
-
-            # -- STEP 3a: Skip outbound echoes / typing events --
-            if item.get("is_outbound"):
-                continue
-            if "is_typing" in item:
-                continue
-
-            # -- STEP 3b: Routing filter -- is this for our number? --
-            inbound_line = self._value(
-                item.get("sendblue_number"),
-                item.get("to_number"),
-            )
-            if self.sendblue_number and inbound_line != self.sendblue_number:
-                continue
-
-            # -- STEP 3c: Allowed-number check is handled at gateway level --
-            # (gateway runner's _is_user_authorized() runs before dispatch)
-
-            # -- STEP 3d: Extract fields --
-            text = self._value(
-                item.get("content"),
-                item.get("text"),
-                item.get("body"),
-            ) or ""
-            from_number = item.get("from_number", "")
-            msg_handle = item.get("message_handle", "")
-            # -- STEP 3d.5: Webhook dedup --
-            # Sendblue retries on 5xx/timeout. The same message_handle
-            # landing twice means a retry, not a new message.
-            if self._is_duplicate(msg_handle):
-                logger.debug(
-                    "[sendblue] duplicate webhook for message_handle=%s — skipping",
-                    msg_handle,
-                )
-                continue
-            media_url = (item.get("media_url") or "").strip() or None
-            group_id = (item.get("group_id") or "").strip()
-            group_display_name = (item.get("group_display_name") or "").strip()
-            is_group = bool(group_id)
-            # In a group, replies route to the group_id, not the sender's
-            # number. In a DM, both are the same effectively (chat_id is
-            # the other party's phone).
-            chat_id = group_id if is_group else from_number
-
-            # -- STEP 3d.7: Record last-inbound handle for reactions --
-            # Tools like sendblue_react look up the most recent handle
-            # by chat_id to target tapbacks.
-            if chat_id and msg_handle:
-                self._last_inbound_handle[chat_id] = msg_handle
-
-            # -- STEP 3e: Media handling --
-            media_urls: List[str] = []
-            media_types: List[str] = []
-            msg_type = MessageType.TEXT
-            if media_url:
-                cached_path, mime_type = await self._download_and_cache_media(
-                    media_url
-                )
-                if cached_path:
-                    media_urls.append(cached_path)
-                    media_types.append(mime_type)
-                    msg_type = self._message_type_from_mime(mime_type)
-                else:
-                    logger.warning(
-                        "[sendblue] media download failed for %s", media_url
-                    )
-                    # Continue with text-only -- don't fail the whole message
-            if not text and media_urls:
-                text = "(attachment)"
-            # Media-only message where all downloads fail falls through to
-            # Step 3f and is silently dropped (no text, nothing to dispatch).
-
-            # -- STEP 3f: Required fields check --
-            if not from_number or not text or not chat_id:
-                logger.debug(
-                    "[sendblue] missing required fields -- "
-                    "from_number=%r, has_text=%s, chat_id=%r",
-                    from_number, bool(text), chat_id,
-                )
-                continue
-
-            # -- STEP 3f.5: Platform-native slash command intercept --
-            if text.strip().lower() == "/quota":
-                async def _send_quota_reply(target=chat_id):
-                    try:
-                        usage = await self._fetch_sendblue_usage()
-                        reply = self._format_quota_response(usage)
-                    except Exception as exc:
-                        logger.exception(
-                            "[sendblue] /quota handler failed: %s", exc
-                        )
-                        reply = "Couldn't fetch Sendblue usage — try again?"
-                    await self.send(target, reply)
-                task = asyncio.create_task(_send_quota_reply())
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-                continue
-
-            # -- STEP 3g: Build MessageEvent --
-            source = self.build_source(
-                chat_id=chat_id,
-                chat_name=group_display_name or chat_id,
-                chat_type="group" if is_group else "dm",
-                user_id=from_number,
-                user_name=from_number,
-            )
-            event = MessageEvent(
-                text=text,
-                message_type=msg_type,
-                source=source,
-                raw_message=item,
-                message_id=msg_handle,
-                media_urls=media_urls,
-                media_types=media_types,
-            )
-
-            # -- STEP 3h: Dispatch to agent --
-            task = asyncio.create_task(self.handle_message(event))
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-
-            # -- STEP 3i: Fire-and-forget read receipt --
-            # Sendblue's mark-read API targets a DM by the other party's
-            # number. There's no documented per-group mark-read, so skip
-            # for group messages. Read receipts are an iMessage-only
-            # feature — calling mark_read on SMS/RCS errors at the API
-            # gate, so gate on service when the field is present (default
-            # to allowed when missing for forward-compat). Track the task
-            # so adapter shutdown can await it cleanly instead of
-            # GC-cancelling mid-flight.
-            service = (item.get("service") or "").lower()
-            service_supports_read = service in ("", "imessage")
-            if self.send_read_receipts and not is_group and service_supports_read:
-                read_task = asyncio.create_task(self.mark_read(from_number))
-                self._background_tasks.add(read_task)
-                read_task.add_done_callback(self._background_tasks.discard)
+            await self._process_inbound_item(item)
 
         # -- STEP 4: Return --
         return web.Response(text="ok")
+
+    async def _process_inbound_item(self, item: Dict[str, Any]) -> None:
+        """Process a single inbound message payload.
+
+        Shared by webhook dispatch (`_handle_webhook`) and polling
+        fallback (`_poll_messages_once`). Handles filtering, dedup,
+        media caching, slash-command intercept, MessageEvent build,
+        and fire-and-forget read receipt. Dedup via
+        ``_is_duplicate(message_handle)`` makes it safe to call from
+        both paths — a message seen by the webhook won't be
+        re-dispatched by polling, and vice versa.
+        """
+        # -- STEP 3a: Skip outbound echoes / typing events --
+        if item.get("is_outbound"):
+            return
+        if "is_typing" in item:
+            return
+
+        # -- STEP 3b: Routing filter -- is this for our number? --
+        inbound_line = self._value(
+            item.get("sendblue_number"),
+            item.get("to_number"),
+        )
+        if self.sendblue_number and inbound_line != self.sendblue_number:
+            return
+
+        # -- STEP 3c: Allowed-number check is handled at gateway level --
+        # (gateway runner's _is_user_authorized() runs before dispatch)
+
+        # -- STEP 3d: Extract fields --
+        text = self._value(
+            item.get("content"),
+            item.get("text"),
+            item.get("body"),
+        ) or ""
+        from_number = item.get("from_number", "")
+        msg_handle = item.get("message_handle", "")
+        # -- STEP 3d.5: Webhook dedup --
+        # Sendblue retries on 5xx/timeout. The same message_handle
+        # landing twice means a retry, not a new message.
+        if self._is_duplicate(msg_handle):
+            logger.debug(
+                "[sendblue] duplicate inbound for message_handle=%s — skipping",
+                msg_handle,
+            )
+            return
+        media_url = (item.get("media_url") or "").strip() or None
+        group_id = (item.get("group_id") or "").strip()
+        group_display_name = (item.get("group_display_name") or "").strip()
+        is_group = bool(group_id)
+        # In a group, replies route to the group_id, not the sender's
+        # number. In a DM, both are the same effectively (chat_id is
+        # the other party's phone).
+        chat_id = group_id if is_group else from_number
+
+        # -- STEP 3d.7: Record last-inbound handle for reactions --
+        # Tools like sendblue_react look up the most recent handle
+        # by chat_id to target tapbacks.
+        if chat_id and msg_handle:
+            self._last_inbound_handle[chat_id] = msg_handle
+
+        # -- STEP 3e: Media handling --
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        msg_type = MessageType.TEXT
+        if media_url:
+            cached_path, mime_type = await self._download_and_cache_media(
+                media_url
+            )
+            if cached_path:
+                media_urls.append(cached_path)
+                media_types.append(mime_type)
+                msg_type = self._message_type_from_mime(mime_type)
+            else:
+                logger.warning(
+                    "[sendblue] media download failed for %s", media_url
+                )
+                # Continue with text-only -- don't fail the whole message
+        if not text and media_urls:
+            text = "(attachment)"
+        # Media-only message where all downloads fail falls through to
+        # Step 3f and is silently dropped (no text, nothing to dispatch).
+
+        # -- STEP 3f: Required fields check --
+        if not from_number or not text or not chat_id:
+            logger.debug(
+                "[sendblue] missing required fields -- "
+                "from_number=%r, has_text=%s, chat_id=%r",
+                from_number, bool(text), chat_id,
+            )
+            return
+
+        # -- STEP 3f.5: Platform-native slash command intercept --
+        if text.strip().lower() == "/quota":
+            async def _send_quota_reply(target=chat_id):
+                try:
+                    usage = await self._fetch_sendblue_usage()
+                    reply = self._format_quota_response(usage)
+                except Exception as exc:
+                    logger.exception(
+                        "[sendblue] /quota handler failed: %s", exc
+                    )
+                    reply = "Couldn't fetch Sendblue usage — try again?"
+                await self.send(target, reply)
+            task = asyncio.create_task(_send_quota_reply())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            return
+
+        # -- STEP 3g: Build MessageEvent --
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=group_display_name or chat_id,
+            chat_type="group" if is_group else "dm",
+            user_id=from_number,
+            user_name=from_number,
+        )
+        event = MessageEvent(
+            text=text,
+            message_type=msg_type,
+            source=source,
+            raw_message=item,
+            message_id=msg_handle,
+            media_urls=media_urls,
+            media_types=media_types,
+        )
+
+        # -- STEP 3h: Dispatch to agent --
+        task = asyncio.create_task(self.handle_message(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        # -- STEP 3i: Fire-and-forget read receipt --
+        # Sendblue's mark-read API targets a DM by the other party's
+        # number. There's no documented per-group mark-read, so skip
+        # for group messages. Read receipts are an iMessage-only
+        # feature — calling mark_read on SMS/RCS errors at the API
+        # gate, so gate on service when the field is present (default
+        # to allowed when missing for forward-compat). Track the task
+        # so adapter shutdown can await it cleanly instead of
+        # GC-cancelling mid-flight.
+        service = (item.get("service") or "").lower()
+        service_supports_read = service in ("", "imessage")
+        if self.send_read_receipts and not is_group and service_supports_read:
+            read_task = asyncio.create_task(self.mark_read(from_number))
+            self._background_tasks.add(read_task)
+            read_task.add_done_callback(self._background_tasks.discard)
 
     # -- abstract method stubs (implemented in subsequent steps) --
 
