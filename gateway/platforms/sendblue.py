@@ -163,7 +163,19 @@ class SendblueAdapter(BasePlatformAdapter):
         self.webhook_secret = (
             extra.get("webhook_secret") or os.getenv("SENDBLUE_WEBHOOK_SECRET", "")
         )
-        self.send_read_receipts = bool(extra.get("send_read_receipts", True))
+        # auto_mark_read is the canonical config key; send_read_receipts is
+        # accepted as a back-compat alias (older configs and the upstream
+        # PR thread both use it).
+        self.auto_mark_read = bool(
+            extra.get("auto_mark_read", extra.get("send_read_receipts", True))
+        )
+        # Internal references still use send_read_receipts to avoid touching
+        # every gate site; keep them in sync.
+        self.send_read_receipts = self.auto_mark_read
+        self.status_callback_url = (
+            extra.get("status_callback_url")
+            or os.getenv("SENDBLUE_STATUS_CALLBACK_URL", "")
+        )
         self.multi_bubble_split = bool(extra.get("multi_bubble_split", False))
         self.daily_cap = int(
             extra.get("sendblue_daily_cap") or os.getenv("SENDBLUE_DAILY_CAP", "200")
@@ -1053,6 +1065,8 @@ class SendblueAdapter(BasePlatformAdapter):
                 payload["number"] = chat_id
             if send_style:
                 payload["send_style"] = send_style
+            if self.status_callback_url:
+                payload["status_callback"] = self.status_callback_url
             status, body = await self._sendblue_api_post(endpoint, payload)
             if not (200 <= status < 300):
                 retryable = (status == 0 or status >= 500)
@@ -1176,6 +1190,8 @@ class SendblueAdapter(BasePlatformAdapter):
             payload["content"] = caption_text
         if send_style:
             payload["send_style"] = send_style
+        if self.status_callback_url:
+            payload["status_callback"] = self.status_callback_url
 
         status, body = await self._sendblue_api_post(endpoint, payload)
         if not (200 <= status < 300):
@@ -1381,8 +1397,10 @@ class SendblueAdapter(BasePlatformAdapter):
         """Send a read receipt for a received iMessage.
 
         POST /api/mark-read. Sendblue accepts 200 or 202 as success.
-        Gated by self.send_read_receipts (extra.send_read_receipts,
-        default True).
+        Gated by self.auto_mark_read (extra.auto_mark_read, default
+        True; legacy extra.send_read_receipts also honored). Inbound
+        webhooks for non-iMessage services skip this call upstream;
+        this method itself is service-agnostic.
         """
         if not self.send_read_receipts:
             return False

@@ -1596,3 +1596,59 @@ class TestSendblueReactions:
         adapter._last_inbound_handle["+17766768883"] = "handle-abc"
         ok = await adapter.send_reaction("+17766768883", "like")
         assert ok is False
+
+
+class TestSendblueAutoMarkReadConfig:
+    """auto_mark_read is the canonical key; send_read_receipts is a
+    back-compat alias. Both should resolve to the same internal flag."""
+
+    def test_default_is_true(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.auto_mark_read is True
+        assert adapter.send_read_receipts is True
+
+    def test_auto_mark_read_false_disables(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, auto_mark_read=False)
+        assert adapter.auto_mark_read is False
+        assert adapter.send_read_receipts is False
+
+    def test_legacy_send_read_receipts_alias(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        assert adapter.auto_mark_read is False
+        assert adapter.send_read_receipts is False
+
+    def test_auto_mark_read_wins_over_legacy(self, monkeypatch):
+        # If both are set, the canonical key wins.
+        adapter = _make_adapter(
+            monkeypatch, auto_mark_read=True, send_read_receipts=False,
+        )
+        assert adapter.auto_mark_read is True
+        assert adapter.send_read_receipts is True
+
+
+class TestSendblueStatusCallback:
+    """status_callback_url propagates into outbound payloads when set,
+    and is absent when unset."""
+
+    @pytest.mark.asyncio
+    async def test_send_text_no_callback_by_default(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._sendblue_api_post = AsyncMock(return_value=(200, "{}"))
+        await adapter.send("+17766768883", "hi")
+        payload = adapter._sendblue_api_post.call_args[0][1]
+        assert "status_callback" not in payload
+
+    @pytest.mark.asyncio
+    async def test_send_text_includes_callback_when_configured(self, monkeypatch):
+        url = "https://example.com/sendblue/status"
+        adapter = _make_adapter(monkeypatch, status_callback_url=url)
+        adapter._sendblue_api_post = AsyncMock(return_value=(200, "{}"))
+        await adapter.send("+17766768883", "hi")
+        payload = adapter._sendblue_api_post.call_args[0][1]
+        assert payload.get("status_callback") == url
+
+    def test_env_var_populates_callback_url(self, monkeypatch):
+        url = "https://env.example.com/cb"
+        monkeypatch.setenv("SENDBLUE_STATUS_CALLBACK_URL", url)
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.status_callback_url == url
