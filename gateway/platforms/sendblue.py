@@ -176,6 +176,28 @@ class SendblueAdapter(BasePlatformAdapter):
             extra.get("status_callback_url")
             or os.getenv("SENDBLUE_STATUS_CALLBACK_URL", "")
         )
+        # Polling fallback — opt-in safety net for webhook delivery
+        # failures. When enabled, a background task GETs /api/v2/messages
+        # on a cadence and dispatches any inbound message the webhook
+        # missed. Dedup via _is_duplicate(message_handle) prevents
+        # double-processing when both paths see the same message.
+        self.polling_enabled = bool(extra.get("polling_enabled", False))
+        self.polling_interval_seconds = max(
+            10,
+            int(
+                extra.get("polling_interval_seconds")
+                or os.getenv("SENDBLUE_POLLING_INTERVAL_SECONDS", "60")
+            ),
+        )
+        self.polling_lookback_seconds = max(
+            60,
+            int(
+                extra.get("polling_lookback_seconds")
+                or os.getenv("SENDBLUE_POLLING_LOOKBACK_SECONDS", "300")
+            ),
+        )
+        self._polling_task: Optional[asyncio.Task] = None
+        self._polling_cursor_iso: str = ""
         self.multi_bubble_split = bool(extra.get("multi_bubble_split", False))
         self.daily_cap = int(
             extra.get("sendblue_daily_cap") or os.getenv("SENDBLUE_DAILY_CAP", "200")
@@ -890,6 +912,97 @@ class SendblueAdapter(BasePlatformAdapter):
             self._background_tasks.add(read_task)
             read_task.add_done_callback(self._background_tasks.discard)
 
+    async def _poll_messages_once(self) -> int:
+        """Fetch inbound messages since the last polling cursor and
+        dispatch any not already seen via the webhook.
+
+        Returns the number of new messages dispatched. Failures log
+        a warning and return 0; the cursor is only advanced on a
+        successful fetch so the next tick retries the same window.
+        """
+        if not self._polling_cursor_iso:
+            # First tick — seed cursor at startup-lookback.
+            self._polling_cursor_iso = (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=self.polling_lookback_seconds)
+            ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        status, data = await self._sendblue_api_get(
+            "v2/messages",
+            {
+                "is_outbound": "false",
+                "created_at_gte": self._polling_cursor_iso,
+                "limit": 50,
+            },
+            timeout=10.0,
+        )
+        if status != 200 or not isinstance(data, dict):
+            logger.warning(
+                "[sendblue] polling fetch failed: status=%s body=%s",
+                status, str(data)[:200],
+            )
+            return 0
+
+        messages = data.get("messages") or data.get("data") or []
+        if not isinstance(messages, list):
+            logger.warning(
+                "[sendblue] polling: unexpected messages shape: %s",
+                type(messages).__name__,
+            )
+            return 0
+
+        dispatched = 0
+        max_created_at = self._polling_cursor_iso
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            created_at = str(item.get("created_at") or "")
+            if created_at and created_at > max_created_at:
+                max_created_at = created_at
+            # Dedup ring inside _process_inbound_item ensures messages
+            # already handled by the webhook are skipped silently.
+            handle = item.get("message_handle", "")
+            if handle and handle in self._seen_handles:
+                continue
+            await self._process_inbound_item(item)
+            dispatched += 1
+
+        self._polling_cursor_iso = max_created_at
+        if dispatched:
+            logger.info(
+                "[sendblue] polling recovered %d missed inbound message(s)",
+                dispatched,
+            )
+        return dispatched
+
+    async def _polling_loop(self) -> None:
+        """Background polling task — runs while adapter is connected.
+
+        Sleeps polling_interval_seconds between ticks. Cancels cleanly
+        via asyncio.CancelledError; other exceptions are swallowed
+        with WARNING so a single bad poll doesn't kill the loop.
+        """
+        logger.info(
+            "[sendblue] polling fallback active "
+            "(interval=%ds, lookback=%ds)",
+            self.polling_interval_seconds,
+            self.polling_lookback_seconds,
+        )
+        try:
+            while True:
+                try:
+                    await self._poll_messages_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "[sendblue] polling loop iteration failed: %s", exc
+                    )
+                await asyncio.sleep(self.polling_interval_seconds)
+        except asyncio.CancelledError:
+            logger.info("[sendblue] polling loop cancelled")
+            raise
+
     # -- abstract method stubs (implemented in subsequent steps) --
 
     async def connect(self) -> bool:
@@ -969,6 +1082,10 @@ class SendblueAdapter(BasePlatformAdapter):
         # Step 6: Webhook URL registration (non-fatal on failure)
         await self._register_webhook()
 
+        # Step 6.5: Spawn polling fallback if enabled
+        if self.polling_enabled:
+            self._polling_task = asyncio.create_task(self._polling_loop())
+
         # Step 7: Return
         return True
 
@@ -977,6 +1094,16 @@ class SendblueAdapter(BasePlatformAdapter):
 
         See architecture Section 3 disconnect sequence.
         """
+        # Step 0: Cancel polling loop (must happen before client close
+        # so an in-flight GET doesn't get torn out from under it)
+        if self._polling_task is not None:
+            self._polling_task.cancel()
+            try:
+                await self._polling_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._polling_task = None
+
         # Step 1: Unregister webhook (non-critical, logged at DEBUG on failure)
         await self._unregister_webhook()
 

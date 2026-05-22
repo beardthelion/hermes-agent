@@ -1652,3 +1652,159 @@ class TestSendblueStatusCallback:
         monkeypatch.setenv("SENDBLUE_STATUS_CALLBACK_URL", url)
         adapter = _make_adapter(monkeypatch)
         assert adapter.status_callback_url == url
+
+
+class TestSendbluePollingConfig:
+    """Config field defaults + bounds for polling fallback."""
+
+    def test_defaults_disabled(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.polling_enabled is False
+        assert adapter.polling_interval_seconds == 60
+        assert adapter.polling_lookback_seconds == 300
+
+    def test_enable_via_extra(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            polling_enabled=True,
+            polling_interval_seconds=30,
+            polling_lookback_seconds=120,
+        )
+        assert adapter.polling_enabled is True
+        assert adapter.polling_interval_seconds == 30
+        assert adapter.polling_lookback_seconds == 120
+
+    def test_minimum_clamps(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            polling_interval_seconds=1,
+            polling_lookback_seconds=10,
+        )
+        assert adapter.polling_interval_seconds == 10
+        assert adapter.polling_lookback_seconds == 60
+
+
+class TestSendbluePollMessagesOnce:
+    """_poll_messages_once should fetch, dispatch new messages,
+    skip already-seen handles, and advance the cursor."""
+
+    @pytest.mark.asyncio
+    async def test_seeds_cursor_on_first_tick(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, polling_enabled=True)
+        adapter._sendblue_api_get = AsyncMock(
+            return_value=(200, {"messages": []})
+        )
+        assert adapter._polling_cursor_iso == ""
+        await adapter._poll_messages_once()
+        assert adapter._polling_cursor_iso.endswith("Z")
+        params = adapter._sendblue_api_get.call_args[0][1]
+        assert params["is_outbound"] == "false"
+        assert "created_at_gte" in params
+
+    @pytest.mark.asyncio
+    async def test_dispatches_new_messages(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, polling_enabled=True)
+        # Pre-seed cursor older than the test message so the advance
+        # check exercises the real comparison.
+        adapter._polling_cursor_iso = "2026-05-21T21:00:00.000Z"
+        adapter._sendblue_api_get = AsyncMock(return_value=(200, {
+            "messages": [
+                {
+                    "from_number": "+17766768883",
+                    "content": "hello from poll",
+                    "message_handle": "h-new-1",
+                    "created_at": "2026-05-21T22:00:00.000Z",
+                    "sendblue_number": "+15555550100",
+                    "service": "imessage",
+                },
+            ],
+        }))
+        adapter._process_inbound_item = AsyncMock()
+        n = await adapter._poll_messages_once()
+        assert n == 1
+        adapter._process_inbound_item.assert_awaited_once()
+        assert adapter._polling_cursor_iso == "2026-05-21T22:00:00.000Z"
+
+    @pytest.mark.asyncio
+    async def test_skips_already_seen_handles(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, polling_enabled=True)
+        adapter._seen_handles["h-old"] = None
+        adapter._sendblue_api_get = AsyncMock(return_value=(200, {
+            "messages": [
+                {
+                    "from_number": "+17766768883",
+                    "content": "dup",
+                    "message_handle": "h-old",
+                    "created_at": "2026-05-21T22:00:00.000Z",
+                },
+            ],
+        }))
+        adapter._process_inbound_item = AsyncMock()
+        n = await adapter._poll_messages_once()
+        assert n == 0
+        adapter._process_inbound_item.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_returns_zero_no_cursor_advance(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, polling_enabled=True)
+        adapter._polling_cursor_iso = "2026-05-21T21:00:00.000Z"
+        adapter._sendblue_api_get = AsyncMock(return_value=(500, "boom"))
+        adapter._process_inbound_item = AsyncMock()
+        n = await adapter._poll_messages_once()
+        assert n == 0
+        adapter._process_inbound_item.assert_not_awaited()
+        assert adapter._polling_cursor_iso == "2026-05-21T21:00:00.000Z"
+
+    @pytest.mark.asyncio
+    async def test_unexpected_shape_returns_zero(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, polling_enabled=True)
+        adapter._sendblue_api_get = AsyncMock(
+            return_value=(200, {"messages": "not-a-list"})
+        )
+        adapter._process_inbound_item = AsyncMock()
+        n = await adapter._poll_messages_once()
+        assert n == 0
+        adapter._process_inbound_item.assert_not_awaited()
+
+
+class TestSendbluePollingLoop:
+    """_polling_loop sleeps between ticks, swallows iteration errors,
+    and cancels cleanly."""
+
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch, polling_enabled=True, polling_interval_seconds=60,
+        )
+        adapter._poll_messages_once = AsyncMock(return_value=0)
+        task = asyncio.create_task(adapter._polling_loop())
+        await asyncio.sleep(0)  # let the loop run one iteration
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        adapter._poll_messages_once.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_iteration_exception_does_not_kill_loop(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch, polling_enabled=True, polling_interval_seconds=60,
+        )
+        call_count = 0
+
+        async def flaky():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("transient")
+            return 0
+
+        adapter._poll_messages_once = flaky
+        task = asyncio.create_task(adapter._polling_loop())
+        # Yield enough times for the flaky iteration to fire and the
+        # loop to enter sleep.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert call_count >= 1
