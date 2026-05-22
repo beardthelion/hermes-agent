@@ -943,7 +943,11 @@ class SendblueAdapter(BasePlatformAdapter):
             )
             return 0
 
-        messages = data.get("messages") or data.get("data") or []
+        # Sendblue /api/v2/messages returns {"data": [...]} with each
+        # message keyed on `date_sent` (ISO Z timestamp). Older paths
+        # (or future variants) may key on `messages`/`created_at`, so
+        # tolerate both with `data`/`date_sent` as the canonical shape.
+        messages = data.get("data") or data.get("messages") or []
         if not isinstance(messages, list):
             logger.warning(
                 "[sendblue] polling: unexpected messages shape: %s",
@@ -952,13 +956,15 @@ class SendblueAdapter(BasePlatformAdapter):
             return 0
 
         dispatched = 0
-        max_created_at = self._polling_cursor_iso
+        max_cursor = self._polling_cursor_iso
         for item in messages:
             if not isinstance(item, dict):
                 continue
-            created_at = str(item.get("created_at") or "")
-            if created_at and created_at > max_created_at:
-                max_created_at = created_at
+            item_ts = str(
+                item.get("date_sent") or item.get("created_at") or ""
+            )
+            if item_ts and item_ts > max_cursor:
+                max_cursor = item_ts
             # Dedup ring inside _process_inbound_item ensures messages
             # already handled by the webhook are skipped silently.
             handle = item.get("message_handle", "")
@@ -967,7 +973,7 @@ class SendblueAdapter(BasePlatformAdapter):
             await self._process_inbound_item(item)
             dispatched += 1
 
-        self._polling_cursor_iso = max_created_at
+        self._polling_cursor_iso = max_cursor
         if dispatched:
             logger.info(
                 "[sendblue] polling recovered %d missed inbound message(s)",

@@ -1692,7 +1692,7 @@ class TestSendbluePollMessagesOnce:
     async def test_seeds_cursor_on_first_tick(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, polling_enabled=True)
         adapter._sendblue_api_get = AsyncMock(
-            return_value=(200, {"messages": []})
+            return_value=(200, {"status": "OK", "data": []})
         )
         assert adapter._polling_cursor_iso == ""
         await adapter._poll_messages_once()
@@ -1708,14 +1708,15 @@ class TestSendbluePollMessagesOnce:
         # check exercises the real comparison.
         adapter._polling_cursor_iso = "2026-05-21T21:00:00.000Z"
         adapter._sendblue_api_get = AsyncMock(return_value=(200, {
-            "messages": [
+            "status": "OK",
+            "data": [
                 {
                     "from_number": "+17706768883",
                     "content": "hello from poll",
                     "message_handle": "h-new-1",
-                    "created_at": "2026-05-21T22:00:00.000Z",
+                    "date_sent": "2026-05-21T22:00:00.000Z",
                     "sendblue_number": "+15555550100",
-                    "service": "imessage",
+                    "service": "iMessage",
                 },
             ],
         }))
@@ -1730,12 +1731,13 @@ class TestSendbluePollMessagesOnce:
         adapter = _make_adapter(monkeypatch, polling_enabled=True)
         adapter._seen_handles["h-old"] = None
         adapter._sendblue_api_get = AsyncMock(return_value=(200, {
-            "messages": [
+            "status": "OK",
+            "data": [
                 {
                     "from_number": "+17706768883",
                     "content": "dup",
                     "message_handle": "h-old",
-                    "created_at": "2026-05-21T22:00:00.000Z",
+                    "date_sent": "2026-05-21T22:00:00.000Z",
                 },
             ],
         }))
@@ -1759,12 +1761,33 @@ class TestSendbluePollMessagesOnce:
     async def test_unexpected_shape_returns_zero(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, polling_enabled=True)
         adapter._sendblue_api_get = AsyncMock(
-            return_value=(200, {"messages": "not-a-list"})
+            return_value=(200, {"data": "not-a-list"})
         )
         adapter._process_inbound_item = AsyncMock()
         n = await adapter._poll_messages_once()
         assert n == 0
         adapter._process_inbound_item.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_legacy_messages_key_shape_still_works(self, monkeypatch):
+        # Forward/back-compat: tolerate {"messages": [...]} as well.
+        adapter = _make_adapter(monkeypatch, polling_enabled=True)
+        adapter._polling_cursor_iso = "2026-05-21T21:00:00.000Z"
+        adapter._sendblue_api_get = AsyncMock(return_value=(200, {
+            "messages": [
+                {
+                    "from_number": "+17706768883",
+                    "content": "legacy shape",
+                    "message_handle": "h-legacy",
+                    "created_at": "2026-05-21T22:00:00.000Z",
+                    "sendblue_number": "+15555550100",
+                },
+            ],
+        }))
+        adapter._process_inbound_item = AsyncMock()
+        n = await adapter._poll_messages_once()
+        assert n == 1
+        assert adapter._polling_cursor_iso == "2026-05-21T22:00:00.000Z"
 
 
 class TestSendbluePollingLoop:
