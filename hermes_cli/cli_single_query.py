@@ -227,7 +227,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             )
 
         _report_turn(result)
-        if isinstance(result, dict) and not result.get("failed"):
+        if isinstance(result, dict) and _single_query_exit_code(result) == 0:
             history = result.get("messages") or cli.conversation_history
 
             def _follow_up(text):

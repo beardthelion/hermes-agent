@@ -518,8 +518,17 @@ class CLIChatTurnMixin:
             if pending:
                 self._pending_input.put(pending)
             return None
-        # "failed"/"partial" with an empty final_response: no usable answer.
-        if turn.result and (turn.result.get("failed") or turn.result.get("partial")) and not response:
+        # Any failure-carrier result with an empty final_response has no usable answer.
+        if (
+            turn.result
+            and (
+                turn.result.get("failed")
+                or turn.result.get("partial")
+                or turn.result.get("completed") is False
+                or turn.result.get("error")
+            )
+            and not response
+        ):
             from hermes_cli.cli_chat_error_copy import chat_error_response
             response = chat_error_response(
                 str(turn.result.get("error") or "Unknown error"),

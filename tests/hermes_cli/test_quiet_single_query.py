@@ -111,6 +111,35 @@ def test_turn_report_is_written_before_the_exit_linger_and_the_path_is_not_inher
     assert qsq.read_turn_report(str(report), os.getpid() + 1) is None
 
 
+def test_bare_error_does_not_enter_notify_completion_continuation(monkeypatch):
+    """An errored turn is terminal even when the backend omitted the legacy ``failed`` flag."""
+    from hermes_cli import quiet_single_query as qsq
+
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    continued = []
+
+    def run_conversation(**kwargs):
+        return {"final_response": "", "error": "provider unavailable", "messages": []}
+
+    def continue_clean(*args, **kwargs):
+        continued.append(True)
+        return {"final_response": "later clean answer", "messages": []}
+
+    monkeypatch.setattr(qsq, "continue_quiet_notify_completions", continue_clean)
+    monkeypatch.setattr("tools.process_registry.process_registry.wait_for_pending_completions",
+                        lambda *a, **k: {"waited": [], "completed": [], "timed_out": []})
+    agent = SimpleNamespace(run_conversation=run_conversation, session_id="s-1")
+
+    try:
+        cli._run_quiet_single_query(
+            SimpleNamespace(agent=agent, conversation_history=[], session_id="s-1"), "hello")
+    except SystemExit as exc:
+        assert exc.code == 1
+
+    assert continued == []
+
+
 def test_a_follow_up_turn_rewrites_the_report_with_the_answer_it_displaces(monkeypatch, tmp_path):
     """The report says what this run will print. When a teammate's reply during the linger runs a
     follow-up turn whose answer displaces the first (the quiet run's final-answer contract), the
